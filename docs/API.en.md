@@ -1,8 +1,8 @@
-# AntPwn API Reference
+﻿# AntPwn API Reference
 
 [中文](API.md) | **English**
 
-Version: AntPwn v1.3.0
+Version: AntPwn v1.4.0
 Platform: Linux / x86-64, Python 3.9+ (developed and verified on 3.11 and 3.14)
 Dependencies: none (standard library only)
 
@@ -30,6 +30,8 @@ into your scripts, platform or CTF toolchain.
 14. `antpwn.i18n` — language control
 15. Recipes
 16. Boundaries and pitfalls
+17. `antpwn.color` — terminal colour styling
+18. `antpwn.repl` — interactive browser (r2-style)
 
 ---
 
@@ -307,6 +309,29 @@ with Tube(path) as t:
 
 `Tube` is for normal I/O; to inspect a crash site (registers/memory) use `Process` below.
 
+### `RemoteTube` — remote targets
+
+Same interface as `Tube`, backed by a TCP socket (`antpwn/procio.py`):
+
+```python
+from antpwn.procio import RemoteTube
+
+t = RemoteTube("10.0.0.1", 1337)   # connect to the service directly
+t.sendline(b"1")
+print(t.recv_until(b">"))
+t.close()
+```
+
+| Method | Description |
+|---|---|
+| `send` / `sendline` / `recv` / `recv_until` / `clean` / `drain` | same semantics as `Tube` |
+| `alive()` | whether the socket is still alive (MSG_PEEK probe) |
+| `interactive_cmds(cmds)` | send commands in order and collect output |
+| `close()` | shutdown + close |
+
+`pwn --remote HOST:PORT` makes `ExploitContext.new_tube()` return a `RemoteTube`; all
+strategies are shared with local mode.
+
 ---
 
 ## 8. `antpwn.debugger` — ptrace debugger
@@ -578,9 +603,15 @@ print(Ret2Text(ctx).run())
 ```python
 from antpwn.fsm import FSM, State, Logger
 
-fsm = FSM(path, log=None, lang="zh")
+fsm = FSM(path, log=None, lang="zh", remote=None, keep_shell=False)
 ok = fsm.run()
 ```
+
+| Parameter | Description |
+|---|---|
+| `path` | local binary (used for static analysis even for remote targets) |
+| `remote` | `(host, port)`: exploit traffic goes over TCP, analysis stays local |
+| `keep_shell` | keep the shell open on success (for `fsm.interactive()`) |
 
 ### Run
 
@@ -602,10 +633,29 @@ obtained.
 
 ```
 path, mitigations{pie,nx,canary,relro,execstack,arch}, functions[],
-findings[], strategies[], offset, aco[], notes[], result, steps[]
+findings[], strategies[], offset, aco[], notes[], result, steps[],
+flag, shell_output, remote
 ```
 
 `result` values: `pwned:dag` / `pwned:<strategy>` / `failed` / `not_elf`.
+`flag` is the flag captured from the shell (None if not found); `shell_output` is the raw
+output read while hunting; `remote` is `host:port` or None.
+
+### Shell interaction and flag capture
+
+| Method | Description |
+|---|---|
+| `_grab_flag()` | run `id`/`pwd`/`ls -la`/`cat flag*` in the live shell, return the first flag match (`FLAG_RE`) |
+| `_announce_flag()` | print the flag, or the first lines of shell output; close the shell unless `keep_shell` |
+| `interactive()` | hand over the shell: stdin lines go to the target, output is echoed; `exit`/`quit`/EOF leaves |
+
+`--remote` + `-i` together mean "exploit the remote and stay in the shell":
+
+```python
+fsm = FSM("./pwn200", remote=("10.0.0.1", 1337), keep_shell=True)
+if fsm.run():
+    fsm.interactive()
+```
 
 ### Offset inference
 
@@ -742,3 +792,66 @@ route and only want AntPwn's probing and sending logic.
   verification in `FSM.run()` is the final word.
 - **API stability**: within v1.x the documented public members are stable; underscore-prefixed
   methods and attributes are internal and may change between releases.
+
+---
+
+## 17. `antpwn.color` — terminal colour styling
+
+```python
+from antpwn import color
+
+color.enabled()                       # whether styling is active (cached decision)
+color.style("text", "bold", "red")    # generic ANSI wrapper
+color.strip(s)                        # remove ANSI escapes (for files/assertions)
+```
+
+Semantic helpers (already keyed to finding kind, severity and FSM state):
+
+| Helper | Purpose |
+|---|---|
+| `head` / `section` / `info` / `dim` | heading, section, info, de-emphasis |
+| `ok` / `good` / `warn` / `err` | success, strong success, warning, error |
+| `value_yes` / `value_no` | mitigation ON (warm) / OFF (cool) |
+| `kind(name)` / `score(n)` | finding kind / severity score |
+| `state(name)` / `event(ok, text)` | state-machine tag / transition |
+
+Rules:
+
+- ANSI is emitted only when stdout is a TTY; pipes, redirections and `capture_output` get plain
+  text, so string matching in `tests/run_all.py` is unaffected;
+- `ANTPWN_COLOR=1/0` forces it on/off; `NO_COLOR` / `CLICOLOR=0` disables it;
+- on Windows console VT processing is enabled automatically, falling back to plain text on failure;
+- the CLI exposes it as `--color auto|always|never` (default `auto`).
+
+---
+
+## 18. `antpwn.repl` — interactive browser (r2-style)
+
+```python
+from antpwn.elf import ELF
+from antpwn.repl import Repl
+
+Repl(ELF("./pwn200")).run()
+```
+
+CLI: `python3 antpwn.py view <binary>` (alias `repl`).
+
+| Command | Description |
+|---|---|
+| `info` / `i` | mitigations, entry, counts of functions/sections/strings |
+| `ls [pat]` | list functions (filter by name, 200 lines by default) |
+| `disas [func\|0xaddr] [n]` | disassemble, `n` is a byte count (symbol size or 0x40 by default) |
+| `pseudo [func\|0xaddr]` | pseudo-code (needs a function symbol; an address resolves to its function) |
+| `calls [func]` | callees of a function |
+| `strings [minlen]` | list strings |
+| `find <text>` / `/` | search function names and strings |
+| `gadgets` / `rop` | ROP gadget summary |
+| `plt` / `imports` | PLT imports |
+| `sec` / `sections` | sections and segments |
+| `x <addr> [n]` | hex view |
+| `quit` / `q` / `exit` | leave |
+
+- `Repl` is read-only static browsing; it does not execute the target and needs no
+  pwntools/rizin. Commands are backed by `ELF` / `Disasm` / `Decompiler` / `GadgetFinder`.
+- Piped input is supported for scripting and self-tests:
+  `printf 'info\nls\ndisas vuln\nquit\n' | python3 antpwn.py view ./pwn`.

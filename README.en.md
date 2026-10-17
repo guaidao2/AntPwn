@@ -1,10 +1,10 @@
-# AntPwn — Pwn Analysis Assistant (Analysis · Planning · Auto Verification)
+﻿# AntPwn — Pwn Analysis Assistant (Analysis · Planning · Auto Verification)
 
 [中文](README.md) | **English**
 
 > by guaidao2 · coolmoon
 
-**author: guaidao2** · version 1.3.0 · bilingual (zh / en)
+**author: guaidao2** · version 1.4.0 · bilingual (zh / en)
 
 > Native static analysis · pseudo-code recovery · vulnerability scanning · ptrace debugging ·
 > capability-DAG planning · state-machine driven
@@ -44,7 +44,12 @@ containers and can be imported as a library into your own toolchain.
 | State machine | RECON → DECOMPILE → SCAN → STRATEGY → OFFSET → BUILD → TEST → VERIFY, every step explained in plain words |
 | Auto verification | 8 userland strategies, selected by behaviour rather than function names; a successful run gives an interactive shell, used to verify the judgement, not to do your job for you |
 | Failure diagnosis | When a strategy is not feasible it says why: missing gadget, no leak channel, where PIE or Canary blocks the chain, and what to try next |
+| Flag capture | After getting a shell it runs `id` / `pwd` / `ls` / `cat flag*` etc. and prints the first `flag{...}`-shaped match |
+| Remote targets | `--remote HOST:PORT`: the local binary is used for analysis, the exploit traffic goes over TCP, same DAG/strategies |
+| Interactive shell | `-i`: after success the shell is handed to you; type commands line by line, see output immediately |
+| Interactive browser | `view <binary>`: r2-style session with `info` / `ls` / `disas` / `pseudo` / `calls` / `x` / `gadgets` |
 | Reporting / i18n | `--lang zh / en`; `--report out.html` writes the conclusions and decision record |
+| Terminal colour | ANSI styling on a TTY; `--color always / never` or `NO_COLOR` / `ANTPWN_COLOR` to override; pipes and logs degrade to plain text |
 | Embeddable | `antpwn` is a pure-stdlib package; the CLI is a thin shell, analysis/debugging/state machine can be used directly as a library |
 
 ## When it fits
@@ -85,6 +90,15 @@ python3 antpwn.py pwn ./challenges/bin/ret2libc
 
 # Verification + HTML report + English output
 python3 antpwn.py pwn ./pwn200 --report out.html --lang en
+
+# Attack a remote service: local binary for analysis, exploit traffic over TCP
+python3 antpwn.py pwn ./challenges/bin/ret2libc --remote 10.0.0.1:1337
+
+# Take over the shell after success (type commands, read output)
+python3 antpwn.py pwn ./challenges/bin/baby_bof -i
+
+# r2-style interactive browser for disassembly and pseudo-code
+python3 antpwn.py view ./challenges/bin/baby_bof
 ```
 
 All key parameters (overflow offset, format-string argument index, heap chunk addresses) are
@@ -153,6 +167,8 @@ AntPwn/
 │   ├── exploits.py    #   8 exploitation strategies
 │   ├── fsm.py         #   solver state machine
 │   ├── i18n.py        #   bilingual strings
+│   ├── color.py       #   terminal colour styling (TTY only)
+│   ├── repl.py        #   interactive disasm / pseudo-code browser (view)
 │   ├── report.py      #   HTML report
 │   └── cli.py         #   command line entry
 ├── challenges/        # 8 original challenges (with source) + 3 advanced + 2 blind

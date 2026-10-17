@@ -1,8 +1,8 @@
-# AntPwn API 文档
+﻿# AntPwn API 文档
 
 [中文](API.md) | [English](API.en.md)
 
-适用版本：AntPwn v1.3.0
+适用版本：AntPwn v1.4.0
 运行环境：Linux / x86-64，Python 3.9+（开发和验证环境为 3.11 与 3.14）
 依赖：无第三方包，纯标准库
 
@@ -29,6 +29,8 @@ AntPwn 的 CLI 只是薄壳，所有能力都在 `antpwn` 包里。这份文档�
 14. `antpwn.i18n` — 语言控制
 15. 典型用法
 16. 边界与坑
+17. `antpwn.color` — 终端配色
+18. `antpwn.repl` — 交互式浏览（r2 风格）
 
 ---
 
@@ -304,6 +306,29 @@ with Tube(path) as t:
 
 `Tube` 用于正常 I/O；要看崩溃现场（寄存器/内存）用下一节的 `Process`。
 
+### `RemoteTube` — 远程目标
+
+接口与 `Tube` 完全一致，换成 TCP socket（`antpwn/procio.py`）：
+
+```python
+from antpwn.procio import RemoteTube
+
+t = RemoteTube("10.0.0.1", 1337)   # 直接连服务
+t.sendline(b"1")
+print(t.recv_until(b">"))
+t.close()
+```
+
+| 方法 | 说明 |
+|---|---|
+| `send` / `sendline` / `recv` / `recv_until` / `clean` / `drain` | 语义与 `Tube` 相同 |
+| `alive()` | socket 是否还活着（MSG_PEEK 探测） |
+| `interactive_cmds(cmds)` | 依次发命令收集输出 |
+| `close()` | shutdown + close |
+
+`pwn --remote HOST:PORT` 就是让 `ExploitContext.new_tube()` 返回 `RemoteTube`，
+其余策略与本地完全共用。
+
 ---
 
 ## 8. `antpwn.debugger` — ptrace 调试器
@@ -570,9 +595,15 @@ print(Ret2Text(ctx).run())
 ```python
 from antpwn.fsm import FSM, State, Logger
 
-fsm = FSM(path, log=None, lang="zh")
+fsm = FSM(path, log=None, lang="zh", remote=None, keep_shell=False)
 ok = fsm.run()
 ```
+
+| 参数 | 说明 |
+|---|---|
+| `path` | 本地二进制（远程题也用它做静态分析） |
+| `remote` | `(host, port)`：利用流量走 TCP，分析仍基于本地二进制 |
+| `keep_shell` | True 时不关闭成功拿到的 shell（配合 `fsm.interactive()`） |
 
 ### 运行
 
@@ -592,11 +623,30 @@ ok = fsm.run()
 `report_data` 的键：
 
 ```
-path, mitigations{pix,nx,canary,relro,execstack,arch}, functions[],
-findings[], strategies[], offset, aco[], notes[], result, steps[]
+path, mitigations{pie,nx,canary,relro,execstack,arch}, functions[],
+findings[], strategies[], offset, aco[], notes[], result, steps[],
+flag, shell_output, remote
 ```
 
 `result` 取值：`pwned:dag` / `pwned:<strategy>` / `failed` / `not_elf`。
+`flag` 是拿到 shell 后自动抓到的 flag 文本（没抓到为 None）；`shell_output` 是抓取时
+shell 的原始输出；`remote` 是 `host:port` 或 None。
+
+### shell 交互与 flag
+
+| 方法 | 说明 |
+|---|---|
+| `_grab_flag()` | 在存活 shell 里跑 `id`/`pwd`/`ls -la`/`cat flag*` 等，返回匹配到的 flag（正则 `FLAG_RE`） |
+| `_announce_flag()` | 打印 flag；没抓到就打印 shell 输出前几行；按 `keep_shell` 决定是否关掉 shell |
+| `interactive()` | 接管 shell：逐行读 stdin 发给目标并回显输出，`exit`/`quit`/EOF 退出 |
+
+`--remote` + `-i` 组合起来就是「打完远程题直接进 shell」：
+
+```python
+fsm = FSM("./pwn200", remote=("10.0.0.1", 1337), keep_shell=True)
+if fsm.run():
+    fsm.interactive()
+```
 
 ### 偏移推断相关
 
@@ -729,3 +779,66 @@ best, score = colony.run()
 - **扫描是启发式**：`score` 只是排序优先级，不是结论；最终以 `FSM.run()` 的动态验证为准。
 - **API 稳定性**：v1.x 内以本文档列出的公开成员为准；下划线开头的方法/属性是内部实现，
   可能随版本调整。
+
+---
+
+## 17. `antpwn.color` — 终端配色
+
+```python
+from antpwn import color
+
+color.enabled()                       # 当前是否启用（判定结果会缓存）
+color.style("text", "bold", "red")    # 通用：包一层 ANSI 样式
+color.strip(s)                        # 去掉 ANSI 转义序列（写文件/断言用）
+```
+
+语义助手（内部已按漏洞类型、危险度和状态分好色）：
+
+| 助手 | 用途 |
+|---|---|
+| `head` / `section` / `info` / `dim` | 标题、分节、信息、弱化 |
+| `ok` / `good` / `warn` / `err` | 成功、强调成功、警告、错误 |
+| `value_yes` / `value_no` | 保护开启（偏暖色）/ 关闭（偏冷色） |
+| `kind(name)` / `score(n)` | 漏洞类型 / 危险度评分 |
+| `state(name)` / `event(ok, text)` | 状态机标签 / 状态迁移 |
+
+行为规则：
+
+- 只有 stdout 是 TTY 时才输出 ANSI；管道、重定向、`capture_output` 采集时自动降级为
+  纯文本，所以 `tests/run_all.py` 这类字符串匹配不受影响；
+- `ANTPWN_COLOR=1/0` 强制开关；`NO_COLOR` / `CLICOLOR=0` 关闭；
+- Windows 下自动开启控制台 VT 处理，失败即退化为纯文本；
+- 配色由 CLI 的 `--color auto|always|never` 控制（默认 `auto`）。
+
+---
+
+## 18. `antpwn.repl` — 交互式浏览（r2 风格）
+
+```python
+from antpwn.elf import ELF
+from antpwn.repl import Repl
+
+Repl(ELF("./pwn200")).run()
+```
+
+CLI：`python3 antpwn.py view <binary>`（别名 `repl`）。
+
+| 命令 | 说明 |
+|---|---|
+| `info` / `i` | 保护状态、入口、函数/节/字符串数量 |
+| `ls [pat]` | 函数列表（可按名字过滤，默认最多 200 行） |
+| `disas [func\|0xaddr] [n]` | 反汇编，`n` 为字节数（缺省用符号大小或 0x40） |
+| `pseudo [func\|0xaddr]` | 伪代码（需要函数符号；给地址会找所属函数） |
+| `calls [func]` | 该函数调用了谁 |
+| `strings [minlen]` | 字符串列表 |
+| `find <text>` / `/` | 搜函数名与字符串 |
+| `gadgets` / `rop` | ROP gadget 摘要 |
+| `plt` / `imports` | PLT 导入表 |
+| `sec` / `sections` | 节与段 |
+| `x <addr> [n]` | 十六进制视图 |
+| `quit` / `q` / `exit` | 退出 |
+
+- `Repl` 是只读静态浏览，不执行目标、不依赖 pwntools/rizin；命令都在进程内用
+  `ELF` / `Disasm` / `Decompiler` / `GadgetFinder` 实现。
+- 支持管道输入，便于脚本化和自测：
+  `printf 'info\nls\ndisas vuln\nquit\n' | python3 antpwn.py view ./pwn`。

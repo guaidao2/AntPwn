@@ -1,10 +1,10 @@
-# AntPwn 蚁刃 — Pwn 分析助手（分析 · 决策 · 自动验证）
+﻿# AntPwn 蚁刃 — Pwn 分析助手（分析 · 决策 · 自动验证）
 
 [中文](README.md) | [English](README.en.md)
 
 > by guaidao2 · coolmoon
 
-**author: guaidao2** · version 1.3.0 · 中英双语 / bilingual
+**author: guaidao2** · version 1.4.0 · 中英双语 / bilingual
 
 > 原生静态分析 · 伪代码还原 · 漏洞扫描 · ptrace 动态调试 · 能力 DAG 规划 · 状态机驱动
 
@@ -39,7 +39,12 @@ exploit 脚本或 payload 文本，也不承诺"丢进去就出 flag"——它�
 | 状态机 | RECON → DECOMPILE → SCAN → STRATEGY → OFFSET → BUILD → TEST → VERIFY，每步都有中文说明 |
 | 自动验证 | 8 种用户态策略，基于行为特征而非函数名；跑通即拿到交互式 shell，用来验证判断而不是替你交差 |
 | 失败诊断 | 策略不可行时说明原因：缺 gadget / 缺泄露通道 / PIE 与 Canary 卡在哪一步，并给出下一步方向 |
+| flag 捕获 | 拿到 shell 后自动执行 `id` / `pwd` / `ls` / `cat flag*` 等，命中 `flag{...}` 形态就直接打印 |
+| 远程直打 | `--remote HOST:PORT`：本地二进制负责分析，利用流量走 TCP，同一套 DAG/策略直接打远程服务 |
+| 交互 shell | `-i`：成功后接管 shell，逐行发命令、即时看输出，适合看 flag 或手工收尾 |
+| 交互浏览 | `view <binary>`：r2 风格交互，`info` / `ls` / `disas` / `pseudo` / `calls` / `x` / `gadgets` 等 |
 | 报告与双语 | `--lang zh / en`；`--report out.html` 输出分析结论与决策记录 |
+| 终端配色 | TTY 下自动启用 ANSI 配色；`--color always / never` 或 `NO_COLOR` / `ANTPWN_COLOR` 强制开关，管道与日志自动降级为纯文本 |
 | 可嵌入 | `antpwn` 是纯标准库包，CLI 只是薄壳，分析/调试/状态机均可直接当函数库用 |
 
 ## 它适合什么场景
@@ -77,6 +82,15 @@ python3 antpwn.py pwn ./challenges/bin/ret2libc
 
 # 自动验证 + HTML 报告 + 英文输出
 python3 antpwn.py pwn ./pwn200 --report out.html --lang en
+
+# 打远程服务：本地二进制用于分析，利用流量走 TCP
+python3 antpwn.py pwn ./challenges/bin/ret2libc --remote 10.0.0.1:1337
+
+# 成功后接管 shell（逐行发命令，适合看 flag / 手工收尾）
+python3 antpwn.py pwn ./challenges/bin/baby_bof -i
+
+# r2 风格交互浏览反汇编与伪代码
+python3 antpwn.py view ./challenges/bin/baby_bof
 ```
 
 参数（溢出偏移、fmt 参数位置、堆 chunk 地址）全部动态探测，不依赖特定函数名或题目提示语；
@@ -139,6 +153,8 @@ AntPwn/
 │   ├── exploits.py    #   8 种利用策略
 │   ├── fsm.py         #   解题状态机
 │   ├── i18n.py        #   中英双语
+│   ├── color.py       #   终端配色（TTY 自动启用）
+│   ├── repl.py        #   交互式反汇编/伪代码浏览（view）
 │   ├── report.py      #   HTML 报告
 │   └── cli.py         #   命令行入口
 ├── challenges/        # 8 道原创靶场题（含源码）+ 3 道高级题 + 2 道盲测题

@@ -79,6 +79,10 @@ def save_report(fsm, path):
         notes = "<li>-</li>"
 
     result = d.get("result", "-")
+    if d.get("flag"):
+        result = f"{result}  |  flag: {d['flag']}"
+    if d.get("remote"):
+        result = f"{result}  |  remote: {d['remote']}"
     rescls = "off" if result.startswith("pwned") else "on"
 
     page = TPL.format(

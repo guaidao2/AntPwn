@@ -56,6 +56,8 @@ _ZH = {
     "srop_hint": "SROP (信号返回导向)",
     "pivot": "栈劫持 (stack pivot)",
     "offbynull": "单字节 null 溢出",
+    "flag_found": "已拿到 flag",
+    "flag_not_found": "shell 里没读到 flag（可能没有 flag 文件，或路径不同）",
     "author": "作者: guaidao2 · coolmoon",
 }
 _EN = {
@@ -113,6 +115,8 @@ _EN = {
     "srop_hint": "SROP (signal return-oriented programming)",
     "pivot": "stack pivot",
     "offbynull": "off-by-null overflow",
+    "flag_found": "flag captured",
+    "flag_not_found": "no flag found in the shell (no flag file, or a different path)",
     "author": "authors: guaidao2 · coolmoon",
 }
 

