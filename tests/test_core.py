@@ -694,6 +694,19 @@ class TestI386(unittest.TestCase):
         self.assertIn("uint32_t", text2)
 
 
+class TestGdbLoader(unittest.TestCase):
+    def test_gdbinit_line_registers_plugin(self):
+        from antpwn.gdb_loader import gdbinit_line, load_expr
+        line = gdbinit_line()
+        self.assertIn("antpwn.gdbplugin.register()", line)
+        self.assertIn("sys.path.insert", line)
+        self.assertTrue(load_expr().startswith("import sys"))
+
+    def test_help_exits_zero(self):
+        from antpwn.gdb_loader import main
+        self.assertEqual(main(["--help"]), 0)
+
+
 class TestPackagingFiles(unittest.TestCase):
     def test_pyproject_and_ci(self):
         root = pathlib.Path(__file__).resolve().parent.parent

@@ -4,7 +4,7 @@
 
 > by guaidao2 · coolmoon
 
-**author: guaidao2** · version 1.7.0 · bilingual (zh / en)
+**author: guaidao2** · version 1.7.1 · bilingual (zh / en)
 
 > Native static analysis · pseudo-code recovery · vulnerability scanning · ptrace debugging ·
 > capability-DAG planning · state-machine driven
@@ -52,7 +52,7 @@ containers and can be imported as a library into your own toolchain.
 | Dataflow scan | correlates `read`/`scanf` lengths with stack buffer sizes: exact overflow bytes, off-by-one detection, and no false positive for width-limited `scanf("%63s")` |
 | New strategies | `one_gadget`, `ret2csu` (with one_gadget), `ret2dlresolve`, byte-wise canary brute force (remote fork servers) |
 | Plugin API | `register_strategy()` / `register_technique()` add strategies and capability-DAG edges without touching the core |
-| gdb plugin | `source antpwn-gdb.py` (or run `antpwn-gdb` after pip install for a .gdbinit line). Commands: `where`/`recon`/`vuln --bp`/`disas` (defaults to `$pc`)/`pseudo`/`x $rsp`/`leak`/`maps`/`offset [gen\|0x..]`/`trace on [funcs] [--stop --max=N --dump]`/`plan` (paste-ready next steps)/`report`/`export`/`reset`; dedicated prompt, tab completion, zh/en, coexists with gef/pwndbg |
+| gdb plugin | `source antpwn-gdb.py` (or `antpwn-gdb ./vuln` launches gdb with the plugin; `antpwn-gdb --write` appends the .gdbinit line). Commands: `where`/`recon`/`vuln --bp`/`disas` (defaults to `$pc`)/`pseudo`/`x $rsp`/`leak`/`maps`/`offset [gen\|0x..]`/`trace on [funcs] [--stop --max=N --dump]`/`plan` (paste-ready next steps)/`report`/`export`/`reset`; dedicated prompt, tab completion, zh/en, coexists with gef/pwndbg |
 | Structured / reproducible | `pwn --json` (full result incl. trace and pheromone), `--no-pheromone`, `--libc PATH`, `--retries N`; `view export` writes html/json |
 | Reporting / i18n | `--lang zh / en`; `--report out.html` writes the conclusions and decision record |
 | Terminal colour | ANSI styling on a TTY; `--color always / never` or `NO_COLOR` / `ANTPWN_COLOR` to override; pipes and logs degrade to plain text |
@@ -202,7 +202,7 @@ AntPwn/
 │   └── cli.py         #   command line entry
 ├── challenges/        # 8 original challenges (with source) + 3 advanced + 2 blind
 ├── antpwn-gdb.py      # gdb plugin loader (source this file inside gdb)
-├── antpwn/gdb_loader.py # `antpwn-gdb` command: print/append the .gdbinit snippet
+├── antpwn/gdb_loader.py # `antpwn-gdb` command: launch gdb with the plugin, or print/append the .gdbinit snippet
 ├── pyproject.toml     # pip install + console script (antpwn after pip install .)
 ├── .github/workflows/ # test.yml (CI smoke + unit tests), release.yml (tag release)
 ├── docs/API.md        # full API reference (中文), API.en.md (English)

@@ -2,7 +2,7 @@
 
 [中文](API.md) | **English**
 
-Version: AntPwn v1.7.0
+Version: AntPwn v1.7.1
 Platform: Linux (x86-64 kernel; 32-bit i386 targets can be analysed), Python 3.9+ (developed and verified on 3.11 and 3.14)
 Dependencies: none (standard library only)
 
@@ -947,7 +947,7 @@ History defaults to `~/.antpwn_history`; `ANTPWN_HISTORY=/path` overrides it and
   not in CI).
 - CI: `.github/workflows/test.yml` runs version checks, `py_compile`, analyze/view/pwn smoke,
   unit tests and a wheel build; `.github/workflows/release.yml` handles tag-driven releases.
-- Installed commands: `antpwn` (CLI), `antpwn-gdb` (print/append the gdbinit snippet).
+- Installed commands: `antpwn` (CLI), `antpwn-gdb` (`antpwn-gdb ./vuln` launches gdb with the plugin; no args prints the gdbinit snippet, `--write` appends it to `~/.gdbinit`).
 - Real gdb test: `bash tests/gdb_smoke.sh` (offset/trace/prompt/completion/leak/export);
   CI runs it when gdb is available.
 - Plugin entry points: `from antpwn import register_strategy, register_technique`.
@@ -964,7 +964,7 @@ Python interpreter is enough):
 (gdb) antpwn help
 ```
 
-After `pip install .` the `antpwn-gdb` command prints a ready-to-paste `~/.gdbinit`
+After `pip install .`, `antpwn-gdb ./vuln` launches gdb with the plugin; `antpwn-gdb` prints a ready-to-paste `~/.gdbinit`
 line (`--write` appends it), or write it by hand:
 
 ```python

@@ -4,7 +4,7 @@
 
 > by guaidao2 · coolmoon
 
-**author: guaidao2** · version 1.7.0 · 中英双语 / bilingual
+**author: guaidao2** · version 1.7.1 · 中英双语 / bilingual
 
 > 原生静态分析 · 伪代码还原 · 漏洞扫描 · ptrace 动态调试 · 能力 DAG 规划 · 状态机驱动
 
@@ -47,7 +47,7 @@ exploit 脚本或 payload 文本，也不承诺"丢进去就出 flag"——它�
 | 数据流扫描 | 把 `read`/`scanf` 的长度与栈缓冲大小做关联：算出确定溢出字节数、识别 off-by-one，`scanf("%63s")` 这类有宽度的不误报 |
 | 新利用策略 | `one_gadget`、`ret2csu`（配合 one_gadget）、`ret2dlresolve`、canary 逐字节爆破（远程 fork 服务） |
 | 插件扩展 | `register_strategy()` / `register_technique()`：外部注册策略与能力 DAG 边，不改核心代码 |
-| gdb 插件 | `source antpwn-gdb.py`（或 pip 装后跑 `antpwn-gdb` 拿 .gdbinit 片段）。命令：`where`/`recon`/`vuln`（`--bp` 自动下断）/`disas`（无参围绕 `$pc`）/`pseudo`/`x $rsp`/`leak`/`maps`/`offset [gen\|0x..]`/`trace on [函数...] [--stop --max=N --dump]`/`plan`（给可粘贴下一步）/`report`/`export`/`reset`；专属提示符、Tab 补全、中英切换，和 gef/pwda 共存不抢提示符 |
+| gdb 插件 | `source antpwn-gdb.py`（或 pip 装后 `antpwn-gdb ./vuln` 直接带插件启动 gdb，`antpwn-gdb --write` 写进 ~/.gdbinit）。命令：`where`/`recon`/`vuln`（`--bp` 自动下断）/`disas`（无参围绕 `$pc`）/`pseudo`/`x $rsp`/`leak`/`maps`/`offset [gen\|0x..]`/`trace on [函数...] [--stop --max=N --dump]`/`plan`（给可粘贴下一步）/`report`/`export`/`reset`；专属提示符、Tab 补全、中英切换，和 gef/pwda 共存不抢提示符 |
 | 结构化与可复现 | `pwn --json` 输出完整结果（含 trace/信息素统计）；`--no-pheromone`、`--libc PATH`、`--retries N`；`view export` 导出 html/json |
 | 报告与双语 | `--lang zh / en`；`--report out.html` 输出分析结论与决策记录 |
 | 终端配色 | TTY 下自动启用 ANSI 配色；`--color always / never` 或 `NO_COLOR` / `ANTPWN_COLOR` 强制开关，管道与日志自动降级为纯文本 |
@@ -188,7 +188,7 @@ AntPwn/
 │   └── cli.py         #   命令行入口
 ├── challenges/        # 8 道原创靶场题（含源码）+ 3 道高级题 + 2 道盲测题
 ├── antpwn-gdb.py      # gdb 插件加载器（gdb 里 source 这个文件）
-├── antpwn/gdb_loader.py # `antpwn-gdb` 命令：打印/写入 .gdbinit 片段
+├── antpwn/gdb_loader.py # `antpwn-gdb` 命令：带插件启动 gdb / 打印·写入 .gdbinit 片段
 ├── pyproject.toml     # pip 安装与 console script（pip install . 后可用 antpwn）
 ├── .github/workflows/ # test.yml（CI 冒烟+单测）与 release.yml（tag 自动发版）
 ├── docs/API.md        # 完整 API 文档（模块 / 数据结构 / 扩展示例）

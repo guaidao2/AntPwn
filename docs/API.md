@@ -2,7 +2,7 @@
 
 [中文](API.md) | [English](API.en.md)
 
-适用版本：AntPwn v1.7.0
+适用版本：AntPwn v1.7.1
 运行环境：Linux（x86-64 内核；可分析 32 位 i386 目标），Python 3.9+（开发和验证环境为 3.11 与 3.14）
 依赖：无第三方包，纯标准库
 
@@ -934,7 +934,7 @@ histedit.save()                         # 落历史
 - 全量回归：`python3 tests/run_all.py`（会连续起靶场进程，本地按需跑，CI 不跑）。
 - CI：`.github/workflows/test.yml` 做版本校验、`py_compile`、analyze/view/pwn 冒烟、
   unittest、wheel 构建；`.github/workflows/release.yml` 负责 tag 触发发版。
-- 打包后的命令：`antpwn`（CLI）、`antpwn-gdb`（打印/写入 gdbinit 片段）。
+- 打包后的命令：`antpwn`（CLI）、`antpwn-gdb`（`antpwn-gdb ./vuln` 带插件启动 gdb；无参打印 gdbinit 片段，`--write` 写入 `~/.gdbinit`）。
 - gdb 真跑测试：`bash tests/gdb_smoke.sh`（offset/trace/prompt/completion/leak/export），
   CI 在装了 gdb 的 runner 上会执行。
 - 插件入口：`from antpwn import register_strategy, register_technique`。
@@ -950,7 +950,7 @@ histedit.save()                         # 落历史
 (gdb) antpwn help
 ```
 
-以 `pip install .` 安装后可以直接跑 `antpwn-gdb` 打印可粘贴的 `~/.gdbinit` 片段
+以 `pip install .` 安装后可以直接跑 `antpwn-gdb ./vuln` 带插件启动 gdb，或 `antpwn-gdb` 打印可粘贴的 `~/.gdbinit` 片段
 （`--write` 会追加写入），或者手工写：
 
 ```python
