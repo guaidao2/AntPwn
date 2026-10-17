@@ -1,8 +1,8 @@
-﻿# AntPwn API Reference
+# AntPwn API Reference
 
 [中文](API.md) | **English**
 
-Version: AntPwn v1.5.1
+Version: AntPwn v1.5.2
 Platform: Linux / x86-64, Python 3.9+ (developed and verified on 3.11 and 3.14)
 Dependencies: none (standard library only)
 

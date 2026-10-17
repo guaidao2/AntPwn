@@ -1,8 +1,8 @@
-﻿# AntPwn API 文档
+# AntPwn API 文档
 
 [中文](API.md) | [English](API.en.md)
 
-适用版本：AntPwn v1.5.1
+适用版本：AntPwn v1.5.2
 运行环境：Linux / x86-64，Python 3.9+（开发和验证环境为 3.11 与 3.14）
 依赖：无第三方包，纯标准库
 

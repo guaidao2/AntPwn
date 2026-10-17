@@ -1,10 +1,10 @@
-﻿[build-system]
+[build-system]
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "antpwn"
-version = "1.5.1"
+version = "1.5.2"
 description = "CTF Pwn analysis assistant: dependency-free ELF analysis, pseudo-code, planning and auto-verification"
 readme = "README.md"
 license = { file = "LICENSE" }

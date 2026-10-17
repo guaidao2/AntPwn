@@ -1,10 +1,10 @@
-﻿# AntPwn 蚁刃 — Pwn 分析助手（分析 · 决策 · 自动验证）
+# AntPwn 蚁刃 — Pwn 分析助手（分析 · 决策 · 自动验证）
 
 [中文](README.md) | [English](README.en.md)
 
 > by guaidao2 · coolmoon
 
-**author: guaidao2** · version 1.5.1 · 中英双语 / bilingual
+**author: guaidao2** · version 1.5.2 · 中英双语 / bilingual
 
 > 原生静态分析 · 伪代码还原 · 漏洞扫描 · ptrace 动态调试 · 能力 DAG 规划 · 状态机驱动
 

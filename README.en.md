@@ -1,10 +1,10 @@
-﻿# AntPwn — Pwn Analysis Assistant (Analysis · Planning · Auto Verification)
+# AntPwn — Pwn Analysis Assistant (Analysis · Planning · Auto Verification)
 
 [中文](README.md) | **English**
 
 > by guaidao2 · coolmoon
 
-**author: guaidao2** · version 1.5.1 · bilingual (zh / en)
+**author: guaidao2** · version 1.5.2 · bilingual (zh / en)
 
 > Native static analysis · pseudo-code recovery · vulnerability scanning · ptrace debugging ·
 > capability-DAG planning · state-machine driven
