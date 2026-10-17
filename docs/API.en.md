@@ -2,7 +2,7 @@
 
 [中文](API.md) | **English**
 
-Version: AntPwn v1.6.0
+Version: AntPwn v1.6.1
 Platform: Linux / x86-64, Python 3.9+ (developed and verified on 3.11 and 3.14)
 Dependencies: none (standard library only)
 
@@ -951,6 +951,7 @@ Commands:
 | `antpwn offset [gen [n]]` | decode the cyclic offset from the current crash; `gen` writes a pattern file |
 | `antpwn trace on\|off\|show` | breakpoints on dangerous PLT calls, logging args + backtrace, auto-continue |
 | `antpwn plan` | rank strategies from capabilities known in this session (offset, libc base) |
+| `antpwn prompt on\|off` | toggle the dedicated prompt (on by default; off restores gdb's prompt) |
 | `antpwn lang zh\|en` | switch language |
 | other `view` commands | `ls` / `strings` / `find` / `gadget` / `export` / `x` ... work as-is |
 

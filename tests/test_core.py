@@ -316,8 +316,10 @@ class TestPackagingFiles(unittest.TestCase):
         self.assertIn("gdbplugin.register()", loader)
         self.assertIn("gdb.Command", plugin)
         for cmd in ("recon", "vuln", "disas", "pseudo", "xrefs", "offset",
-                    "trace", "plan", "lang"):
+                    "trace", "plan", "lang", "prompt"):
             self.assertIn(f'"{cmd}"', plugin)
+        self.assertIn("gdb.prompt_hook", plugin)
+        self.assertIn("set pagination off", plugin)
 
 
 if __name__ == "__main__":

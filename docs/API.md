@@ -2,7 +2,7 @@
 
 [中文](API.md) | [English](API.en.md)
 
-适用版本：AntPwn v1.6.0
+适用版本：AntPwn v1.6.1
 运行环境：Linux / x86-64，Python 3.9+（开发和验证环境为 3.11 与 3.14）
 依赖：无第三方包，纯标准库
 
@@ -932,6 +932,7 @@ python import sys; sys.path.insert(0, "/path/to/AntPwn"); import antpwn.gdbplugi
 | `antpwn offset [gen [n]]` | 从当前崩溃现场反解 cyclic 偏移；`gen` 生成模式文件 |
 | `antpwn trace on\|off\|show` | 在危险 PLT 调用点下断点，记录参数与 backtrace，命中自动继续 |
 | `antpwn plan` | 结合会话内已知能力（offset、libc base）给出策略优先级 |
+| `antpwn prompt on\|off` | 专属提示符开关（默认开，关闭后恢复 gdb 默认提示符） |
 | `antpwn lang zh\|en` | 中英文切换 |
 | 其余 `view` 命令 | `ls` / `strings` / `find` / `gadget` / `export` / `x` 等直接可用 |
 

@@ -4,7 +4,7 @@
 
 > by guaidao2 · coolmoon
 
-**author: guaidao2** · version 1.6.0 · bilingual (zh / en)
+**author: guaidao2** · version 1.6.1 · bilingual (zh / en)
 
 > Native static analysis · pseudo-code recovery · vulnerability scanning · ptrace debugging ·
 > capability-DAG planning · state-machine driven

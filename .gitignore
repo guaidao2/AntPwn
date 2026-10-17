@@ -11,3 +11,4 @@ out*.html
 # 临时目录
 .tmp/
 tmp/
+.codegraph/

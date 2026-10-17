@@ -4,7 +4,7 @@
 
 > by guaidao2 · coolmoon
 
-**author: guaidao2** · version 1.6.0 · 中英双语 / bilingual
+**author: guaidao2** · version 1.6.1 · 中英双语 / bilingual
 
 > 原生静态分析 · 伪代码还原 · 漏洞扫描 · ptrace 动态调试 · 能力 DAG 规划 · 状态机驱动
 

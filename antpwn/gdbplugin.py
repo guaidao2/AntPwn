@@ -47,6 +47,11 @@ STRATEGY_PRIORITY = {
     "ret2syscall": 6, "shellcode": 7, "canary_brute": 8, "offbynull": 9,
 }
 
+# gdb readline needs \001/\002 around the non-printing escape sequences,
+# otherwise cursor positioning breaks on long command lines.
+PROMPT_ON = "\001\033[1;36m\002antpwn\001\033[0m\002$ "
+PROMPT_OFF = "\001\033[1;33m\002antpwn\001\033[0m\002$ "
+
 
 def _t(zh, en):
     return zh if i18n.LANG == "zh" else en
@@ -72,8 +77,10 @@ class AntPwnCommand(gdb.Command):
     """AntPwn analysis inside gdb: antpwn <recon|vuln|disas|pseudo|xrefs|offset|trace|plan|lang>"""
 
     def __init__(self):
-        super().__init__("antpwn", gdb.COMMAND_USER, gdb.COMPLETE_NONE)
+        # completer_class=-1 tells gdb to call our own complete() method
+        super().__init__("antpwn", gdb.COMMAND_USER, completer_class=-1)
         self._repl_cache = {}
+        self.prompt_enabled = True
         self.offset = None
         self.caps = set()
         self.trace_bps = []
@@ -145,19 +152,23 @@ class AntPwnCommand(gdb.Command):
         rows = [
             ("recon", "保护/入口/摘要 / protections and summary", "antpwn recon"),
             ("vuln [kind|func]", "扫描漏洞并标注 / scan and mark findings", "antpwn vuln"),
-            ("disas [func|addr] [n]", "反汇编（漏洞行高亮 + 当前 PC）/ disasm with PC marker", "antpwn disas vuln"),
+            ("disas [func|addr] [n]", "反汇编（漏洞高亮 + PC 标记）/ disasm with PC marker", "antpwn disas vuln"),
             ("pseudo [func|addr]", "伪代码 / pseudo-code", "antpwn pseudo vuln"),
             ("xrefs [func]", "调用关系 / callers + callees", "antpwn xrefs vuln"),
             ("offset [gen [n]]", "从崩溃现场反解偏移 / decode offset from crash", "antpwn offset"),
-            ("trace on|off|show", "在危险调用点自动断点记录参数 / dynamic call tracing", "antpwn trace on"),
-            ("plan", "按当前已知能力给出策略建议 / strategy plan", "antpwn plan"),
+            ("trace on|off|show", "危险调用动态追踪 / dynamic call tracing", "antpwn trace on"),
+            ("plan", "按已知能力给策略建议 / strategy plan", "antpwn plan"),
+            ("prompt on|off", "专属提示符开关 / toggle the antpwn prompt", "antpwn prompt off"),
             ("lang zh|en", "中英文切换 / switch language", "antpwn lang en"),
-            ("<view 命令>", "其余 view 命令（ls/strings/find/gadget/export…）也可直接用", "antpwn ls"),
+            ("<view cmd>", "其余 view 命令也可直接用 / other view commands work too", "antpwn ls"),
         ]
         print(color.section("== AntPwn gdb =="))
         for name, desc, example in rows:
-            print(f"  {color.style(name, 'bold'):<26} {desc}")
+            pad = " " * max(1, 22 - len(name))
+            print(f"  {color.style(name, 'bold')}{pad}{desc}")
             print(color.dim(f"    {example}"))
+        print(color.dim(_t("gdb 自带 readline：命令历史、Ctrl-R、Tab 补全都可用",
+                           "gdb's readline is in charge: history, Ctrl-R and Tab completion work")))
         print()
 
     def cmd_recon(self):
@@ -426,6 +437,19 @@ class AntPwnCommand(gdb.Command):
                            "tip: run antpwn offset / antpwn trace first; capabilities accumulate in the session")))
         print()
 
+    def cmd_prompt(self, arg=""):
+        mode = arg.strip().lower()
+        if mode == "off":
+            self.prompt_enabled = False
+            print(color.ok(_t("antpwn 提示符已关闭（恢复 gdb 默认）",
+                              "antpwn prompt off (back to the gdb default)")))
+        elif mode == "on":
+            self.prompt_enabled = True
+            print(color.ok(_t("antpwn 提示符已开启", "antpwn prompt on")))
+        else:
+            print(color.dim(_t("用法: antpwn prompt on|off / usage: antpwn prompt on|off")))
+        print()
+
     def cmd_lang(self, arg=""):
         lang = arg.strip().lower()
         if lang not in ("zh", "en"):
@@ -436,6 +460,7 @@ class AntPwnCommand(gdb.Command):
 
     # ---------------- dispatch ----------------
     def invoke(self, arg, from_tty):
+        self.dont_repeat()
         argv = gdb.string_to_argv(arg)
         sub = argv[0].lower() if argv else "help"
         rest = " ".join(argv[1:])
@@ -457,22 +482,35 @@ class AntPwnCommand(gdb.Command):
             "trace": lambda: self.cmd_trace(rest),
             "plan": lambda: self.cmd_plan(),
             "lang": lambda: self.cmd_lang(rest),
+            "prompt": lambda: self.cmd_prompt(rest),
         }
-        if sub in handlers:
-            handlers[sub]()
-            return
-        # everything else is a `view` command (ls/strings/find/gadget/export/...)
-        repl = self._repl()
-        fn = repl._commands.get(sub)
-        if fn is None:
-            print(color.err(f"unknown antpwn command: {sub}") + color.dim("  (antpwn help)"))
-            return
-        fn(rest)
+        # our output is python prints, not gdb's pager; keep it from pausing
+        try:
+            old_pagination = gdb.parameter("pagination")
+        except Exception:
+            old_pagination = None
+        if old_pagination:
+            gdb.execute("set pagination off", to_string=True)
+        try:
+            if sub in handlers:
+                handlers[sub]()
+                return
+            # everything else is a `view` command (ls/strings/find/gadget/export/...)
+            repl = self._repl()
+            fn = repl._commands.get(sub)
+            if fn is None:
+                print(color.err(f"unknown antpwn command: {sub}") + color.dim("  (antpwn help)"))
+                return
+            fn(rest)
+        finally:
+            if old_pagination:
+                gdb.execute("set pagination on", to_string=True)
 
     def complete(self, text, word):
         subs = ["help", "recon", "vuln", "disas", "pseudo", "xrefs", "offset",
-                "trace", "plan", "lang", "ls", "strings", "find", "gadget",
-                "export", "x", "plt", "sec"]
+                "trace", "plan", "prompt", "lang", "ls", "strings", "find",
+                "gadget", "export", "x", "plt", "sec"]
+        word = word or ""
         return [s for s in subs if s.startswith(word)]
 
 
@@ -489,11 +527,26 @@ def _sev(score):
 _plugin = None
 
 
+def _prompt_hook(current_prompt):
+    """gdb.prompt_hook: dedicated prompt while the plugin is loaded"""
+    if _plugin is None or not _plugin.prompt_enabled:
+        return current_prompt
+    try:
+        alive = gdb.selected_inferior().pid != 0
+    except Exception:
+        alive = False
+    return PROMPT_ON if alive else PROMPT_OFF
+
+
 def register():
     """idempotent registration of the `antpwn` gdb command"""
     global _plugin
     if _plugin is None:
         _plugin = AntPwnCommand()
+        try:
+            gdb.prompt_hook = _prompt_hook
+        except Exception:
+            pass
         gdb.write(_t("AntPwn gdb 插件已加载：输入 antpwn help 查看命令\n",
                      "AntPwn gdb plugin loaded: type antpwn help\n"))
     return _plugin
