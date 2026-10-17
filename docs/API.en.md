@@ -2,7 +2,7 @@
 
 [中文](API.md) | **English**
 
-Version: AntPwn v1.5.0
+Version: AntPwn v1.5.1
 Platform: Linux / x86-64, Python 3.9+ (developed and verified on 3.11 and 3.14)
 Dependencies: none (standard library only)
 
