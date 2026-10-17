@@ -112,13 +112,15 @@ class DecisionTree:
 class Colony:
     """ants walk the capability DAG; blackboard carries checkpoints"""
 
-    def __init__(self, edges, log, phero_path="antpwn_pheromone.json"):
+    def __init__(self, edges, log, phero_path="antpwn_pheromone.json", enabled=True):
         self.edges = edges
         self.tree = DecisionTree()
         self.log = log
         self.phero_path = phero_path
+        self.enabled = enabled
         self.stats = {}          # feature_sig -> {edge_name: [wins, tries]}
-        self._load()
+        if self.enabled:
+            self._load()
 
     # ---------------- persistence ----------------
     def _sig(self, ctx):
@@ -128,19 +130,28 @@ class Colony:
                           sort_keys=True)
 
     def _load(self):
-        if os.path.exists(self.phero_path):
-            try:
-                with open(self.phero_path) as fh:
-                    self.stats = json.load(fh)
-            except Exception:
-                self.stats = {}
+        if not os.path.exists(self.phero_path):
+            return
+        try:
+            with open(self.phero_path) as fh:
+                self.stats = json.load(fh)
+        except Exception:
+            self.stats = {}
 
     def _save(self):
+        if not self.enabled:
+            return
         try:
             with open(self.phero_path, "w") as fh:
                 json.dump(self.stats, fh, indent=1)
         except OSError:
             pass
+
+    def edge_report(self, ctx):
+        """wins/tries of every edge for this binary's signature (for reports)."""
+        sig = self._sig(ctx)
+        return {name: {"wins": w, "tries": t}
+                for name, (w, t) in self.stats.get(sig, {}).items()}
 
     def _edge_stats(self, sig, name):
         d = self.stats.setdefault(sig, {})

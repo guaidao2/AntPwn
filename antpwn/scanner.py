@@ -1,6 +1,8 @@
 """AntPwn vulnerability scanner: rule engine on decompiler output
-漏洞扫描: 危险函数规则 + 模式识别 + 交叉引用, 定位函数/行/类型
+漏洞扫描: 危险函数规则 + 模式识别 + 参数/缓冲大小关联（定义-使用链简化版）
 """
+import re
+
 from .decompiler import Decompiler
 
 DANGER = {
@@ -44,7 +46,7 @@ class Scanner:
         self.funcs = {}
 
     def scan(self):
-        for sym in self.elf.functions():
+        for sym in self.elf.code_symbols():
             if sym.size == 0 and sym.value == 0:
                 continue
             pf = self.dec.function(sym)
@@ -93,6 +95,104 @@ class Scanner:
                                              ("printf(变量) 无格式化参数",
                                               "printf(variable) with no format string"), 9, t))
         # 5) read into rbp-relative buffer followed by large length (already via DANGER)
+        self._dataflow(sym, pf)
+
+    @staticmethod
+    def _parse_int(text):
+        try:
+            t = text.strip().rstrip(",;)")
+            return int(t, 0)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _parse_call(line):
+        """line like `read@plt(0, v0, 0x200);` -> (base, [args])"""
+        if "(" not in line or ")" not in line:
+            return None, []
+        head = line[:line.find("(")].strip().split()
+        if not head:
+            return None, []
+        base = head[-1].split("@")[0]
+        inside = line[line.find("(") + 1:line.rfind(")")]
+        args = [a.strip() for a in inside.split(",")]
+        return base, args
+
+    def _dataflow(self, sym, pf):
+        """Correlate buffer sizes with the lengths passed to input functions.
+
+        Simplified def-use: stack buffers are declared in the pseudo-code
+        (`char v0[64];`), so the call arguments can be checked against them
+        without a full dataflow engine. Refines/removes the generic DANGER
+        findings from step 1.
+        """
+        # rendered text includes the stack-variable declarations, which the
+        # raw pf.lines do not carry
+        lines = self.dec.render(pf).splitlines()
+        sizes = {}
+        for line in lines:
+            m = re.search(r"char\s+(v\d+)\[(\d+|0x[0-9a-fA-F]+)\]", line)
+            if m:
+                sizes[m.group(1)] = int(m.group(2), 0)
+
+        def drop(evidence):
+            self.findings = [f for f in self.findings
+                             if not (f.func == sym.name and f.evidence == evidence)]
+
+        def add(kind, score, zh, en, evidence):
+            drop(evidence)
+            self.findings.append(Finding(kind, sym.name, sym.value, (zh, en), score, evidence))
+
+        for line in lines:
+            base, args = self._parse_call(line)
+            if not base:
+                continue
+            if base == "read" and len(args) >= 3:
+                buf = args[1]
+                n = self._parse_int(args[2])
+                size = sizes.get(buf)
+                if not (size and n):
+                    continue
+                ev = f"call {base}()"
+                if n > size:
+                    over = n - size
+                    if n == size + 1:
+                        add("bof", 9,
+                            f"off-by-one: read() 读 {n} 字节到 {buf}[{size}]（写入越界 1 字节）",
+                            f"off-by-one: read() writes {n} bytes into {buf}[{size}] (1 byte past)",
+                            ev)
+                    else:
+                        add("bof", 10,
+                            f"read() 读 {n} 字节到 {buf}[{size}]，确定溢出 {over} 字节",
+                            f"read() writes {n} bytes into {buf}[{size}] -> {over} bytes overflow",
+                            ev)
+                else:
+                    drop(ev)      # bounded read into a big enough buffer: no bug
+            elif base in ("gets", "strcpy", "strcat", "sprintf") and len(args) >= 2:
+                buf = args[1] if base != "gets" else args[0]
+                size = sizes.get(buf)
+                if size:
+                    dst = ("sprintf" and args[1]) or buf
+                    sz = sizes.get(dst, size)
+                    add("bof", 10 if base == "gets" else 8,
+                        f"{base}() 写入无长度限制，目标 {dst}[{sz}]（缓冲 {sz} 字节）",
+                        f"{base}() unbounded write into {dst}[{sz}]",
+                        f"call {base}()")
+            elif base == "scanf" and len(args) >= 2:
+                fmt = args[0].strip('"')
+                buf = args[1]
+                size = sizes.get(buf)
+                if "%s" not in fmt or not size:
+                    continue
+                width = re.search(r"%(\d+)s", fmt)
+                ev = f"call {base}()"
+                if width and int(width.group(1)) <= size:
+                    drop(ev)      # scanf("%63s", buf[64]) is bounded
+                elif not width:
+                    add("bof", 8,
+                        f'scanf("{fmt}", {buf}) 的 %s 无宽度限制，目标 {buf}[{size}]',
+                        f'scanf %s has no width limit, target {buf}[{size}]',
+                        ev)
 
     def _scan_strings(self):
         for va, s in self.elf.strings():

@@ -4,7 +4,7 @@
 
 > by guaidao2 · coolmoon
 
-**author: guaidao2** · version 1.4.0 · bilingual (zh / en)
+**author: guaidao2** · version 1.5.0 · bilingual (zh / en)
 
 > Native static analysis · pseudo-code recovery · vulnerability scanning · ptrace debugging ·
 > capability-DAG planning · state-machine driven
@@ -46,8 +46,13 @@ containers and can be imported as a library into your own toolchain.
 | Failure diagnosis | When a strategy is not feasible it says why: missing gadget, no leak channel, where PIE or Canary blocks the chain, and what to try next |
 | Flag capture | After getting a shell it runs `id` / `pwd` / `ls` / `cat flag*` etc. and prints the first `flag{...}`-shaped match |
 | Remote targets | `--remote HOST:PORT`: the local binary is used for analysis, the exploit traffic goes over TCP, same DAG/strategies |
-| Interactive shell | `-i`: after success the shell is handed to you; type commands line by line, see output immediately |
-| Interactive browser | `view <binary>`: r2-style session with `info` / `ls` / `disas` / `pseudo` / `calls` / `x` / `gadgets` |
+| Interactive shell | `-i`: after success the shell is handed to you; type commands line by line, see output immediately; readline editing/history/completion |
+| Interactive browser | `view <binary>`: r2-style session with `info` / `ls` / `disas` / `pseudo` / `calls` / `x` / `vuln` / `xrefs` / `gadget` / `export`; findings are highlighted, readline enabled |
+| Stripped support | without symbols, functions are recovered from the entry point, recursive call targets and prologue patterns, so `analyze`/`view` still work |
+| Dataflow scan | correlates `read`/`scanf` lengths with stack buffer sizes: exact overflow bytes, off-by-one detection, and no false positive for width-limited `scanf("%63s")` |
+| New strategies | `one_gadget`, `ret2csu` (with one_gadget), `ret2dlresolve`, byte-wise canary brute force (remote fork servers) |
+| Plugin API | `register_strategy()` / `register_technique()` add strategies and capability-DAG edges without touching the core |
+| Structured / reproducible | `pwn --json` (full result incl. trace and pheromone), `--no-pheromone`, `--libc PATH`, `--retries N`; `view export` writes html/json |
 | Reporting / i18n | `--lang zh / en`; `--report out.html` writes the conclusions and decision record |
 | Terminal colour | ANSI styling on a TTY; `--color always / never` or `NO_COLOR` / `ANTPWN_COLOR` to override; pipes and logs degrade to plain text |
 | Embeddable | `antpwn` is a pure-stdlib package; the CLI is a thin shell, analysis/debugging/state machine can be used directly as a library |
@@ -99,6 +104,15 @@ python3 antpwn.py pwn ./challenges/bin/baby_bof -i
 
 # r2-style interactive browser for disassembly and pseudo-code
 python3 antpwn.py view ./challenges/bin/baby_bof
+
+# remote + explicit libc + retries
+python3 antpwn.py pwn ./pwn --remote 10.0.0.1:1337 --libc ./libc-2.31.so --retries 3
+
+# machine-readable result / reproducible run (no pheromone I/O)
+python3 antpwn.py pwn ./pwn --json out.json --no-pheromone
+
+# after pip install . the antpwn command is available
+pip install .
 ```
 
 All key parameters (overflow offset, format-string argument index, heap chunk addresses) are
@@ -169,12 +183,15 @@ AntPwn/
 │   ├── i18n.py        #   bilingual strings
 │   ├── color.py       #   terminal colour styling (TTY only)
 │   ├── repl.py        #   interactive disasm / pseudo-code browser (view)
+│   ├── histedit.py    #   readline editing / history / completion (optional)
 │   ├── report.py      #   HTML report
 │   └── cli.py         #   command line entry
 ├── challenges/        # 8 original challenges (with source) + 3 advanced + 2 blind
+├── pyproject.toml     # pip install + console script (antpwn after pip install .)
+├── .github/workflows/ # test.yml (CI smoke + unit tests), release.yml (tag release)
 ├── docs/API.md        # full API reference (中文), API.en.md (English)
 ├── README.en.md       # English README (this file)
-└── tests/run_all.py   # full regression
+└── tests/             # test_core.py (stdlib unittest) + run_all.py (full regression)
 ```
 
 ## Limitations
@@ -188,8 +205,15 @@ AntPwn/
   inventing a path
 - **No standalone exploit script or payload text is generated**: payloads are built and sent
   in-process; to reproduce, write your own script from the strategy and parameters in the report
-- Remote targets need a matching local libc (`ldd` is used to locate it); remote interaction is
-  not built in yet (reuse `antpwn.procio.Tube`)
+- Remote targets need a matching local libc (located via `ldd`, or pass `--libc`); remote
+  interaction is not built in yet (reuse `antpwn.procio.Tube`)
+- Canary brute force only applies to remote fork servers where wrong/right guesses are
+  distinguishable by connection behaviour; single-shot processes cannot be brute-forced
+- off-by-one / off-by-null is detected and scored by default; an experimental stack-overlap
+  exploit ships too (`ANTPWN_OFFBYNULL=1`), but success depends on the stack address low byte
+  landing inside the buffer, so it is not generic
+- `ret2csu` finishes with one_gadget on binaries without a `pop rdi` gadget (requires the
+  optional `one_gadget` tool installed locally)
 
 ---
 

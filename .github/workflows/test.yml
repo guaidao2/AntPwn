@@ -1,0 +1,75 @@
+name: test
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Version consistency (pyproject vs package)
+        run: |
+          set -eu
+          PKG=$(python3 - <<'PY'
+          import pathlib, re
+          text = pathlib.Path("antpwn/__init__.py").read_text(encoding="utf-8")
+          print(re.search(r'__version__\s*=\s*"([^"]+)"', text).group(1))
+          PY
+          )
+          PROJ=$(python3 - <<'PY'
+          import pathlib, re
+          text = pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
+          print(re.search(r'^version = "([^"]+)"', text, re.M).group(1))
+          PY
+          )
+          echo "package=$PKG pyproject=$PROJ"
+          test "$PKG" = "$PROJ"
+
+      - name: Compile all modules
+        run: python3 -m py_compile antpwn.py antpwn/*.py tests/run_all.py
+
+      - name: Static analysis smoke (no target process)
+        run: |
+          set -eu
+          python3 antpwn.py analyze challenges/bin/baby_bof > /tmp/analyze.log
+          grep -q "PIE" /tmp/analyze.log
+          grep -q "bof" /tmp/analyze.log
+
+      - name: View REPL smoke (piped commands)
+        run: |
+          set -eu
+          printf 'info\nvuln\ndisas vuln 32\npseudo vuln\nxrefs vuln\nexport /tmp/view.json\nquit\n' \
+            | python3 antpwn.py view challenges/bin/baby_bof > /tmp/view.log
+          grep -q "vulnerabilities" /tmp/view.log
+          test -s /tmp/view.json
+
+      - name: End-to-end exploit smoke (one challenge)
+        run: |
+          set -eu
+          python3 antpwn.py pwn challenges/bin/baby_bof --no-pheromone --json /tmp/pwn.json > /tmp/pwn.log
+          grep -q "已被拿下\|pwned" /tmp/pwn.log
+          python3 -c "import json; d=json.load(open('/tmp/pwn.json')); assert d['ok'] is True"
+
+      - name: Unit tests (stdlib unittest)
+        run: |
+          set -eu
+          python3 -m unittest discover -s tests -v
+
+      - name: Package build sanity
+        run: |
+          python3 -m pip install --quiet build
+          python3 -m build --wheel --outdir /tmp/dist >/dev/null
+          ls /tmp/dist

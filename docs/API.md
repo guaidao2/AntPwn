@@ -2,7 +2,7 @@
 
 [中文](API.md) | [English](API.en.md)
 
-适用版本：AntPwn v1.4.0
+适用版本：AntPwn v1.5.0
 运行环境：Linux / x86-64，Python 3.9+（开发和验证环境为 3.11 与 3.14）
 依赖：无第三方包，纯标准库
 
@@ -31,6 +31,7 @@ AntPwn 的 CLI 只是薄壳，所有能力都在 `antpwn` 包里。这份文档�
 16. 边界与坑
 17. `antpwn.color` — 终端配色
 18. `antpwn.repl` — 交互式浏览（r2 风格）
+19. 打包、测试与 CI
 
 ---
 
@@ -140,6 +141,9 @@ elf = ELF(path)                   # 读入整个文件；非 ELF 抛 ELFError
 | `read(vaddr, size)` | bytes | 按虚拟地址读文件内容，失败返回 `b""` |
 | `vaddr_to_off(vaddr)` | int 或 None | 虚拟地址 → 文件偏移 |
 | `strings(minlen=4)` | list[(int, str)] | 从 PT_LOAD 段提取可打印字符串（带虚拟地址） |
+| `exec_segments()` | generator[(int, bytes)] | 可执行 PT_LOAD 段（地址 + 内容），函数发现用 |
+| `discovered_functions(max_bytes=0x100000)` | list[Symbol] | stripped 二进制启发式函数发现：入口 + 递归下降 call 目标 + 常见序言特征，命名 `sub_<addr>` |
+| `code_symbols()` | list[Symbol] | 符号够用时用真符号，否则回退启发式发现；`Scanner`、`view` 都走这个入口 |
 
 ### 数据结构
 
@@ -257,6 +261,13 @@ scanner.summary()                # Counter({kind: 数量})
 
 注意：规则引擎是启发式的，给的是「线索 + 打分」，不是证明。判断路线时仍要结合保护、
 gadget 与动态验证（`FSM.run()` 就是干这个的）。
+
+### 参数-缓冲关联（数据流简化版）
+
+扫描器会读渲染后的伪代码，把栈缓冲声明（`char v0[64];`）与输入函数长度关联：
+`read(0, v0, 0x12c)` 会给出「确定溢出 N 字节」（score=10），`size == buf+1` 记成
+off-by-one（score=9），`scanf("%63s", v0)` 因有宽度限制不误报。证据写进
+`Finding.evidence`，`view vuln` 和 HTML 报告都会显示。
 
 ---
 
@@ -574,8 +585,15 @@ FSM 与各策略共享的状态：
 | `SROP` | sigreturn 帧 |
 | `StackPivot` | 栈迁移 |
 | `HeapUAF` | tcache poisoning |
+| `Ret2OneGadget` | 泄露 libc 后跳 one_gadget（普通 ret2libc 不适用时） |
+| `Ret2CsuOneGadget` | 没有 pop rdi：`__libc_csu_init` 泄露 + one_gadget |
+| `Ret2Dlresolve` | 伪造 Elf64 rela/sym/strtab，经 plt0 解析 system（无 libc 场景） |
+| `CanaryBrute` | 远程 fork 服务逐字节爆破 canary（`ANTPWN_BRUTE_MAX` 控制探测上限） |
+| `OffByNull` | 实验性 off-by-null 栈重叠跳后门（默认关闭，`ANTPWN_OFFBYNULL=1` 开启） |
 
-`ALL_STRATEGIES` 是上述 8 个类的列表。单独调用示例：
+`all_strategies()` 返回内置 + 插件注册的全部策略；`register_strategy(MyStrategy)` 可把自定义
+策略挂进 FSM（`EXTRA_STRATEGIES` 保存插件类）。相关工具：`find_one_gadget_offsets(path)`
+（需要本机 `one_gadget`）、`find_writable_bss(elf)`、`csu_gadgets(elf)`。单独调用示例：
 
 ```python
 from antpwn import ELF, Scanner, GadgetFinder
@@ -604,6 +622,8 @@ ok = fsm.run()
 | `path` | 本地二进制（远程题也用它做静态分析） |
 | `remote` | `(host, port)`：利用流量走 TCP，分析仍基于本地二进制 |
 | `keep_shell` | True 时不关闭成功拿到的 shell（配合 `fsm.interactive()`） |
+| `use_pheromone` | 是否读写 `antpwn_pheromone.json`（CLI 的 `--no-pheromone`） |
+| `libc_path` | 显式指定 libc（CLI 的 `--libc`），不传则用 `ldd` 自动定位 |
 
 ### 运行
 
@@ -625,7 +645,7 @@ ok = fsm.run()
 ```
 path, mitigations{pie,nx,canary,relro,execstack,arch}, functions[],
 findings[], strategies[], offset, aco[], notes[], result, steps[],
-flag, shell_output, remote
+flag, shell_output, remote, pheromone{edge: {wins, tries}}, pheromone_enabled
 ```
 
 `result` 取值：`pwned:dag` / `pwned:<strategy>` / `failed` / `not_elf`。
@@ -638,7 +658,7 @@ shell 的原始输出；`remote` 是 `host:port` 或 None。
 |---|---|
 | `_grab_flag()` | 在存活 shell 里跑 `id`/`pwd`/`ls -la`/`cat flag*` 等，返回匹配到的 flag（正则 `FLAG_RE`） |
 | `_announce_flag()` | 打印 flag；没抓到就打印 shell 输出前几行；按 `keep_shell` 决定是否关掉 shell |
-| `interactive()` | 接管 shell：逐行读 stdin 发给目标并回显输出，`exit`/`quit`/EOF 退出 |
+| `interactive()` | 接管 shell：逐行读 stdin 发给目标并回显输出，`exit`/`quit`/EOF 退出（readline 行编辑/历史） |
 
 `--remote` + `-i` 组合起来就是「打完远程题直接进 shell」：
 
@@ -830,8 +850,12 @@ CLI：`python3 antpwn.py view <binary>`（别名 `repl`）。
 | `disas [func\|0xaddr] [n]` | 反汇编，`n` 为字节数（缺省用符号大小或 0x40） |
 | `pseudo [func\|0xaddr]` | 伪代码（需要函数符号；给地址会找所属函数） |
 | `calls [func]` | 该函数调用了谁 |
+| `vuln [kind\|func]` / `bugs` / `check` | 扫描漏洞并按严重度列出，可过滤；同时建立高亮标记 |
 | `strings [minlen]` | 字符串列表 |
 | `find <text>` / `/` | 搜函数名与字符串 |
+| `xrefs [func]` / `callers` | 谁调用了它 + 它调用了谁（懒构建调用图） |
+| `gadget [name\|pattern]` | gadget 搜索，支持自由模式如 `gadget "pop rdi; ret"` |
+| `export <file.json\|file.html>` | 导出分析结果（保护/函数/漏洞），可分享 |
 | `gadgets` / `rop` | ROP gadget 摘要 |
 | `plt` / `imports` | PLT 导入表 |
 | `sec` / `sections` | 节与段 |
@@ -842,3 +866,38 @@ CLI：`python3 antpwn.py view <binary>`（别名 `repl`）。
   `ELF` / `Disasm` / `Decompiler` / `GadgetFinder` 实现。
 - 支持管道输入，便于脚本化和自测：
   `printf 'info\nls\ndisas vuln\nquit\n' | python3 antpwn.py view ./pwn`。
+- **漏洞高亮**：`vuln` 跑一次 `Scanner` 并把发现记录在 `Repl.vuln_ranges`；之后 `disas`
+  在漏洞函数范围内画 `|` 色条，命中危险调用的那一行用 `!` 强标记并追加
+  `; kind score  <= evidence`；`pseudo` 在函数头标 `// [VULN]`，危险调用行按严重度上色；
+  `ls` 在漏洞函数名前加 `!`。
+- **readline**：交互输入走 `antpwn.histedit.read_line()`（`input()` 语义），Linux/macOS
+  上自动启用方向键编辑、上下键历史、Tab 补全（首词补全命令，`disas`/`pseudo`/`calls`
+  的参数补全函数名）；Windows 无 `readline` 模块时自动退化为普通输入，功能不受影响。
+
+### `antpwn.histedit` — 可选的行编辑支持
+
+```python
+from antpwn import histedit
+
+histedit.available()                    # readline 是否可用
+histedit.setup(completer=None, histfile=None)   # 启用，返回是否成功
+histedit.read_line("prompt> ")          # 读一行（EOF 返回 ""）
+histedit.save()                         # 落历史
+```
+
+历史默认写 `~/.antpwn_history`；`ANTPWN_HISTORY=/path` 改路径，`ANTPWN_NO_HISTORY=1`
+关闭持久化。`view` 与 `-i` shell 都用这一套。
+
+---
+
+## 19. 打包、测试与 CI
+
+- `pyproject.toml`：`pip install .` 安装后得到 `antpwn` 命令（`antpwn = "antpwn.cli:main"`）；
+  版本需与 `antpwn/__init__.py` 的 `__version__` 一致，CI 会校验。
+- 单元测试：`python3 -m unittest discover -s tests -v`（纯标准库，不需要 pytest）。
+  覆盖 ELF 解析、stripped 函数发现、反汇编、伪代码、扫描、数据流、配色、插件注册、
+  `view` 导出、打包一致性等。
+- 全量回归：`python3 tests/run_all.py`（会连续起靶场进程，本地按需跑，CI 不跑）。
+- CI：`.github/workflows/test.yml` 做版本校验、`py_compile`、analyze/view/pwn 冒烟、
+  unittest、wheel 构建；`.github/workflows/release.yml` 负责 tag 触发发版。
+- 插件入口：`from antpwn import register_strategy, register_technique`。

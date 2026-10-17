@@ -198,6 +198,90 @@ class ELF:
                     out.setdefault(nm, r.off)
         return out
 
+
+    # ---------- stripped binaries: function discovery ----------
+    def exec_segments(self):
+        """(vaddr, bytes) of executable PT_LOAD segments"""
+        for p in self.phdrs:
+            if p.type == 1 and (p.flags & 1):
+                yield p.vaddr, self.data[p.off:p.off + p.filesz]
+
+    def _in_exec(self, va, ranges):
+        return any(start <= va < start + len(data) for start, data in ranges)
+
+    def discovered_functions(self, max_bytes=0x100000):
+        """Heuristic function discovery for stripped binaries.
+
+        Seeds: e_entry, direct call targets from a linear sweep, and common
+        prologue byte patterns (endbr64 / push rbp;mov rbp,rsp / sub rsp,N).
+        Returns Symbol objects named sub_<addr>, sized up to the next seed.
+        """
+        segs = list(self.exec_segments())
+        if not segs:
+            return []
+        ranges = [(va, data[:max_bytes]) for va, data in segs]
+        total = sum(len(d) for _, d in ranges)
+        if total == 0:
+            return []
+
+        from .disasm import Disasm
+
+        starts = set()
+        if self._in_exec(self.e_entry, ranges):
+            starts.add(self.e_entry)
+        prologues = (b"\xf3\x0f\x1e\xfa",        # endbr64
+                     b"\x55\x48\x89\xe5",        # push rbp; mov rbp, rsp
+                     b"\x48\x83\xec",             # sub rsp, imm8
+                     b"\x48\x81\xec")             # sub rsp, imm32
+        for va, data in ranges:
+            for pat in prologues:
+                pos = 0
+                while True:
+                    i = data.find(pat, pos)
+                    if i < 0:
+                        break
+                    pos = i + 1
+                    starts.add(va + i)
+            try:
+                for ins in Disasm(data, va).linear(len(data)):
+                    if ins.is_call:
+                        tgt = ins.target()
+                        if tgt is not None and self._in_exec(tgt, ranges):
+                            starts.add(tgt)
+            except Exception:
+                continue
+
+        starts = sorted(s for s in starts if self._in_exec(s, ranges))
+        if not starts:
+            return []
+        out = []
+        for idx, addr in enumerate(starts):
+            nxt = starts[idx + 1] if idx + 1 < len(starts) else None
+            size = (nxt - addr) if nxt and nxt > addr else 0x40
+            size = max(0x10, min(size, 0x800))
+            sym = Symbol()
+            sym.name = f"sub_{addr:x}"
+            sym.value = addr
+            sym.size = size
+            sym.info = 0x12       # STB_GLOBAL | STT_FUNC
+            sym.shndx = 0
+            out.append(sym)
+        return out
+
+    def code_symbols(self):
+        """Functions for analysis: real symbols when available, otherwise
+        heuristic discovery (stripped binaries)."""
+        funcs = [s for s in self.functions() if s.value]
+        if len(funcs) >= 8:
+            return funcs
+        found = self.discovered_functions()
+        if not found:
+            return funcs
+        seen = {s.value for s in funcs}
+        merged = list(funcs) + [s for s in found if s.value not in seen]
+        merged.sort(key=lambda s: s.value)
+        return merged
+
     # ---------- helpers ----------
     def read(self, vaddr, size):
         for p in self.phdrs:

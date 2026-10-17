@@ -58,6 +58,10 @@ _ZH = {
     "offbynull": "单字节 null 溢出",
     "flag_found": "已拿到 flag",
     "flag_not_found": "shell 里没读到 flag（可能没有 flag 文件，或路径不同）",
+    "strategy_onegadget": "one_gadget: 泄露 libc 后直接跳 one_gadget",
+    "strategy_csu": "ret2csu: __libc_csu_init 链泄露 + one_gadget",
+    "strategy_dlresolve": "ret2dlresolve: 伪造重定位结构解析 system",
+    "strategy_canary": "canary 爆破: 逐字节猜 canary（远程 fork 服务）",
     "author": "作者: guaidao2 · coolmoon",
 }
 _EN = {
@@ -117,6 +121,10 @@ _EN = {
     "offbynull": "off-by-null overflow",
     "flag_found": "flag captured",
     "flag_not_found": "no flag found in the shell (no flag file, or a different path)",
+    "strategy_onegadget": "one_gadget: leak libc, then jump to a one_gadget",
+    "strategy_csu": "ret2csu: __libc_csu_init leak + one_gadget",
+    "strategy_dlresolve": "ret2dlresolve: fake relocation structures resolve system",
+    "strategy_canary": "canary brute force (remote fork server)",
     "author": "authors: guaidao2 · coolmoon",
 }
 

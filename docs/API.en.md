@@ -2,7 +2,7 @@
 
 [中文](API.md) | **English**
 
-Version: AntPwn v1.4.0
+Version: AntPwn v1.5.0
 Platform: Linux / x86-64, Python 3.9+ (developed and verified on 3.11 and 3.14)
 Dependencies: none (standard library only)
 
@@ -32,6 +32,7 @@ into your scripts, platform or CTF toolchain.
 16. Boundaries and pitfalls
 17. `antpwn.color` — terminal colour styling
 18. `antpwn.repl` — interactive browser (r2-style)
+19. Packaging, tests and CI
 
 ---
 
@@ -141,6 +142,9 @@ ELF64 only; 32-bit binaries raise `ELFError("only ELF64 supported in this build"
 | `read(vaddr, size)` | bytes | read file content by virtual address, `b""` on failure |
 | `vaddr_to_off(vaddr)` | int or None | virtual address → file offset |
 | `strings(minlen=4)` | list[(int, str)] | printable strings from PT_LOAD segments, with virtual addresses |
+| `exec_segments()` | generator[(int, bytes)] | executable PT_LOAD segments (address + bytes) |
+| `discovered_functions(max_bytes=0x100000)` | list[Symbol] | heuristic discovery for stripped binaries: entry + recursive call targets + prologue patterns, named `sub_<addr>` |
+| `code_symbols()` | list[Symbol] | real symbols when available, else the heuristic discovery; used by `Scanner` and `view` |
 
 ### Data structures
 
@@ -259,6 +263,14 @@ scanner.summary()                # Counter({kind: count})
 
 The rule engine is heuristic: it produces leads plus a score, not proof. Route selection still
 combines mitigations, gadgets and dynamic verification (`FSM.run()` does exactly that).
+
+### Buffer/length correlation (simplified dataflow)
+
+The scanner reads the rendered pseudo-code and correlates stack buffer declarations
+(`char v0[64];`) with input lengths: `read(0, v0, 0x12c)` reports the exact overflow size
+(score=10), `size == buf+1` is reported as off-by-one (score=9), and width-limited
+`scanf("%63s", v0)` is not flagged. The evidence lands in `Finding.evidence` and is shown by
+`view vuln` and the HTML report.
 
 ---
 
@@ -582,8 +594,16 @@ All strategies subclass `Strategy` and implement `feasible()` and `run()` (retur
 | `SROP` | sigreturn frame |
 | `StackPivot` | stack pivot |
 | `HeapUAF` | tcache poisoning |
+| `Ret2OneGadget` | leak libc, then jump to a one_gadget (when plain ret2libc does not apply) |
+| `Ret2CsuOneGadget` | no `pop rdi`: `__libc_csu_init` leak + one_gadget |
+| `Ret2Dlresolve` | fake Elf64 rela/sym/strtab resolved through plt0 (no libc needed) |
+| `CanaryBrute` | byte-wise canary brute force on a remote fork server (`ANTPWN_BRUTE_MAX` caps probes) |
+| `OffByNull` | experimental off-by-null stack overlap to the win function (off by default, `ANTPWN_OFFBYNULL=1`) |
 
-`ALL_STRATEGIES` is the list of all eight classes. Standalone use:
+`all_strategies()` returns built-ins plus registered plugins; `register_strategy(MyStrategy)`
+adds a custom strategy to the FSM (`EXTRA_STRATEGIES` keeps plugin classes). Helpers:
+`find_one_gadget_offsets(path)` (needs the optional `one_gadget`), `find_writable_bss(elf)`,
+`csu_gadgets(elf)`. Standalone use:
 
 ```python
 from antpwn import ELF, Scanner, GadgetFinder
@@ -612,6 +632,8 @@ ok = fsm.run()
 | `path` | local binary (used for static analysis even for remote targets) |
 | `remote` | `(host, port)`: exploit traffic goes over TCP, analysis stays local |
 | `keep_shell` | keep the shell open on success (for `fsm.interactive()`) |
+| `use_pheromone` | load/save `antpwn_pheromone.json` (CLI `--no-pheromone`) |
+| `libc_path` | explicit libc (CLI `--libc`); `ldd` is used when omitted |
 
 ### Run
 
@@ -634,7 +656,7 @@ obtained.
 ```
 path, mitigations{pie,nx,canary,relro,execstack,arch}, functions[],
 findings[], strategies[], offset, aco[], notes[], result, steps[],
-flag, shell_output, remote
+flag, shell_output, remote, pheromone{edge: {wins, tries}}, pheromone_enabled
 ```
 
 `result` values: `pwned:dag` / `pwned:<strategy>` / `failed` / `not_elf`.
@@ -647,7 +669,7 @@ output read while hunting; `remote` is `host:port` or None.
 |---|---|
 | `_grab_flag()` | run `id`/`pwd`/`ls -la`/`cat flag*` in the live shell, return the first flag match (`FLAG_RE`) |
 | `_announce_flag()` | print the flag, or the first lines of shell output; close the shell unless `keep_shell` |
-| `interactive()` | hand over the shell: stdin lines go to the target, output is echoed; `exit`/`quit`/EOF leaves |
+| `interactive()` | hand over the shell: stdin lines go to the target, output is echoed; `exit`/`quit`/EOF leaves (readline editing/history) |
 
 `--remote` + `-i` together mean "exploit the remote and stay in the shell":
 
@@ -843,8 +865,12 @@ CLI: `python3 antpwn.py view <binary>` (alias `repl`).
 | `disas [func\|0xaddr] [n]` | disassemble, `n` is a byte count (symbol size or 0x40 by default) |
 | `pseudo [func\|0xaddr]` | pseudo-code (needs a function symbol; an address resolves to its function) |
 | `calls [func]` | callees of a function |
+| `vuln [kind\|func]` / `bugs` / `check` | scan findings, list by severity, filterable; builds highlight markers |
 | `strings [minlen]` | list strings |
 | `find <text>` / `/` | search function names and strings |
+| `xrefs [func]` / `callers` | callers + callees (call graph built lazily) |
+| `gadget [name\|pattern]` | gadget search, free-form patterns like `gadget "pop rdi; ret"` |
+| `export <file.json\|file.html>` | export mitigations/functions/findings for sharing |
 | `gadgets` / `rop` | ROP gadget summary |
 | `plt` / `imports` | PLT imports |
 | `sec` / `sections` | sections and segments |
@@ -855,3 +881,41 @@ CLI: `python3 antpwn.py view <binary>` (alias `repl`).
   pwntools/rizin. Commands are backed by `ELF` / `Disasm` / `Decompiler` / `GadgetFinder`.
 - Piped input is supported for scripting and self-tests:
   `printf 'info\nls\ndisas vuln\nquit\n' | python3 antpwn.py view ./pwn`.
+- **Vulnerability highlighting**: `vuln` runs `Scanner` once and records findings in
+  `Repl.vuln_ranges`; `disas` then draws a `|` rail over vulnerable functions and puts a
+  strong `!` marker on the dangerous call line with `; kind score  <= evidence`; `pseudo`
+  shows `// [VULN]` in the function header and colours dangerous calls; `ls` prefixes
+  vulnerable functions with `!`.
+- **readline**: interactive input goes through `antpwn.histedit.read_line()` (`input()`
+  semantics), so on Linux/macOS you get arrow-key editing, up/down history and Tab
+  completion (commands for the first word, symbol names for `disas`/`pseudo`/`calls`).
+  On Windows, where CPython has no `readline`, it degrades to plain input.
+
+### `antpwn.histedit` — optional line editing
+
+```python
+from antpwn import histedit
+
+histedit.available()                    # is readline importable
+histedit.setup(completer=None, histfile=None)   # enable, returns success
+histedit.read_line("prompt> ")          # read one line ("" on EOF)
+histedit.save()                         # persist history
+```
+
+History defaults to `~/.antpwn_history`; `ANTPWN_HISTORY=/path` overrides it and
+`ANTPWN_NO_HISTORY=1` disables persistence. Both `view` and the `-i` shell use it.
+
+---
+
+## 19. Packaging, tests and CI
+
+- `pyproject.toml`: `pip install .` provides the `antpwn` console command
+  (`antpwn = "antpwn.cli:main"`); its version must match `antpwn.__version__` (CI checks this).
+- Unit tests: `python3 -m unittest discover -s tests -v` (stdlib only, no pytest). They cover ELF
+  parsing, stripped-function discovery, disassembly, pseudo-code, scanning, dataflow, colour,
+  plugin registration, `view` export and packaging consistency.
+- Full regression: `python3 tests/run_all.py` (spawns challenge processes; run on demand locally,
+  not in CI).
+- CI: `.github/workflows/test.yml` runs version checks, `py_compile`, analyze/view/pwn smoke,
+  unit tests and a wheel build; `.github/workflows/release.yml` handles tag-driven releases.
+- Plugin entry points: `from antpwn import register_strategy, register_technique`.

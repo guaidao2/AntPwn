@@ -70,6 +70,11 @@ def save_report(fsm, path):
 
     strategies = html.escape(", ".join(d.get("strategies", [])) or "-")
     aco = "\n".join(f"iter {i}: best={s:.2f}" for i, s in enumerate(d.get("aco", []))) or "-"
+    phero = d.get("pheromone") or {}
+    if phero:
+        aco += "\n" + "\n".join(
+            f"{name}: wins={v['wins']} tries={v['tries']}"
+            for name, v in sorted(phero.items()))
 
     notes = ""
     lang_zh = zh

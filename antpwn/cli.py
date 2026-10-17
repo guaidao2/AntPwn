@@ -92,11 +92,28 @@ def cmd_pwn(args):
     target = color.info(f"{args.binary}") + (
         color.warn(f"  ->  {remote[0]}:{remote[1]}") if remote else "")
     print(f"target: {target}\n")
-    fsm = FSM(args.binary, lang=args.lang, remote=remote, keep_shell=args.shell)
-    ok = fsm.run()
+    attempts = max(1, args.retries)
+    fsm = None
+    ok = False
+    for i in range(attempts):
+        fsm = FSM(args.binary, lang=args.lang, remote=remote,
+                  keep_shell=args.shell, use_pheromone=not args.no_pheromone,
+                  libc_path=args.libc)
+        ok = fsm.run()
+        if ok:
+            break
+        if i + 1 < attempts:
+            print(color.dim(f"[retry {i + 2}/{attempts}] fresh connection"))
     if args.report:
         path = save_report(fsm, args.report)
         print(f"\n[i] {i18n.t('report_saved')}: {color.info(path)}")
+    if args.json:
+        data = dict(fsm.report_data)
+        data["ok"] = ok
+        data["trace"] = [list(t) for t in fsm.trace]
+        with open(args.json, "w", encoding="utf-8") as fp:
+            json.dump(data, fp, ensure_ascii=False, indent=1, default=str)
+        print(f"[i] json -> {args.json}")
     if ok:
         print(color.good(f"\n[+] {i18n.t('done')}  ({i18n.t('author')})"))
         if args.shell:
@@ -138,6 +155,13 @@ def main():
                    help="attack a remote service / 远程目标, e.g. 10.0.0.1:1337")
     p.add_argument("-i", "--shell", action="store_true",
                    help="drop into the shell after success / 成功后进入交互 shell")
+    p.add_argument("--libc", metavar="PATH",
+                   help="use this libc for offsets / 指定 libc")
+    p.add_argument("--json", metavar="PATH", help="dump the run result to json")
+    p.add_argument("--retries", type=int, default=1, metavar="N",
+                   help="retry the whole solve N times with fresh connections / 重试次数")
+    p.add_argument("--no-pheromone", action="store_true",
+                   help="do not load/save antpwn_pheromone.json / 不读写信息素")
     p.set_defaults(handler=cmd_pwn)
 
     v = sub.add_parser("view", parents=[common], aliases=["repl"],

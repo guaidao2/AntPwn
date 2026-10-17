@@ -4,7 +4,7 @@
 
 > by guaidao2 · coolmoon
 
-**author: guaidao2** · version 1.4.0 · 中英双语 / bilingual
+**author: guaidao2** · version 1.5.0 · 中英双语 / bilingual
 
 > 原生静态分析 · 伪代码还原 · 漏洞扫描 · ptrace 动态调试 · 能力 DAG 规划 · 状态机驱动
 
@@ -41,8 +41,13 @@ exploit 脚本或 payload 文本，也不承诺"丢进去就出 flag"——它�
 | 失败诊断 | 策略不可行时说明原因：缺 gadget / 缺泄露通道 / PIE 与 Canary 卡在哪一步，并给出下一步方向 |
 | flag 捕获 | 拿到 shell 后自动执行 `id` / `pwd` / `ls` / `cat flag*` 等，命中 `flag{...}` 形态就直接打印 |
 | 远程直打 | `--remote HOST:PORT`：本地二进制负责分析，利用流量走 TCP，同一套 DAG/策略直接打远程服务 |
-| 交互 shell | `-i`：成功后接管 shell，逐行发命令、即时看输出，适合看 flag 或手工收尾 |
-| 交互浏览 | `view <binary>`：r2 风格交互，`info` / `ls` / `disas` / `pseudo` / `calls` / `x` / `gadgets` 等 |
+| 交互 shell | `-i`：成功后接管 shell，逐行发命令、即时看输出；支持 readline（方向键/历史/Tab） |
+| 交互浏览 | `view <binary>`：r2 风格交互，`info` / `ls` / `disas` / `pseudo` / `calls` / `x` / `vuln` / `xrefs` / `gadget` / `export`；漏洞自动高亮，支持 readline |
+| stripped 支持 | 无符号时用入口 + 递归下降 call 目标 + 序言特征自动发现函数，`analyze`/`view` 在 stripped 二进制上照常工作 |
+| 数据流扫描 | 把 `read`/`scanf` 的长度与栈缓冲大小做关联：算出确定溢出字节数、识别 off-by-one，`scanf("%63s")` 这类有宽度的不误报 |
+| 新利用策略 | `one_gadget`、`ret2csu`（配合 one_gadget）、`ret2dlresolve`、canary 逐字节爆破（远程 fork 服务） |
+| 插件扩展 | `register_strategy()` / `register_technique()`：外部注册策略与能力 DAG 边，不改核心代码 |
+| 结构化与可复现 | `pwn --json` 输出完整结果（含 trace/信息素统计）；`--no-pheromone`、`--libc PATH`、`--retries N`；`view export` 导出 html/json |
 | 报告与双语 | `--lang zh / en`；`--report out.html` 输出分析结论与决策记录 |
 | 终端配色 | TTY 下自动启用 ANSI 配色；`--color always / never` 或 `NO_COLOR` / `ANTPWN_COLOR` 强制开关，管道与日志自动降级为纯文本 |
 | 可嵌入 | `antpwn` 是纯标准库包，CLI 只是薄壳，分析/调试/状态机均可直接当函数库用 |
@@ -91,6 +96,15 @@ python3 antpwn.py pwn ./challenges/bin/baby_bof -i
 
 # r2 风格交互浏览反汇编与伪代码
 python3 antpwn.py view ./challenges/bin/baby_bof
+
+# 远程 + 指定 libc + 失败重连重试
+python3 antpwn.py pwn ./pwn --remote 10.0.0.1:1337 --libc ./libc-2.31.so --retries 3
+
+# 机器可读结果 / 可复现运行（不读写信息素）
+python3 antpwn.py pwn ./pwn --json out.json --no-pheromone
+
+# pip 安装后可以直接用 antpwn 命令
+pip install .
 ```
 
 参数（溢出偏移、fmt 参数位置、堆 chunk 地址）全部动态探测，不依赖特定函数名或题目提示语；
@@ -155,13 +169,16 @@ AntPwn/
 │   ├── i18n.py        #   中英双语
 │   ├── color.py       #   终端配色（TTY 自动启用）
 │   ├── repl.py        #   交互式反汇编/伪代码浏览（view）
+│   ├── histedit.py    #   readline 行编辑/历史/补全（可选）
 │   ├── report.py      #   HTML 报告
 │   └── cli.py         #   命令行入口
 ├── challenges/        # 8 道原创靶场题（含源码）+ 3 道高级题 + 2 道盲测题
+├── pyproject.toml     # pip 安装与 console script（pip install . 后可用 antpwn）
+├── .github/workflows/ # test.yml（CI 冒烟+单测）与 release.yml（tag 自动发版）
 ├── docs/API.md        # 完整 API 文档（模块 / 数据结构 / 扩展示例）
 ├── docs/API.en.md     # 同上英文版 / English version of the API reference
 ├── README.en.md       # 英文版 README / English README
-└── tests/run_all.py   # 全量回归
+└── tests/             # test_core.py 单测（stdlib unittest）+ run_all.py 全量回归
 ```
 
 ## 已知边界 / Limitations
@@ -172,7 +189,11 @@ AntPwn/
   如实报告失败并给出诊断，不编造可行路径
 - **不生成独立的 exploit 脚本或 payload 文本**：payload 在进程内构造与发送；需要复现时
   按报告里的策略与参数自己写脚本
-- 远程题需本地有相同 libc（`ldd` 自动定位）；远程交互暂不内置（可复用 `antpwn.procio.Tube`）
+- 远程题需本地有相同 libc（`ldd` 自动定位，或用 `--libc` 显式指定）；远程交互暂不内置（可复用 `antpwn.procio.Tube`）
+- canary 爆破只适用于远程 fork 服务，且要求“猜错/猜对”在连接行为上可区分；单次进程不行
+- off-by-one / off-by-null 默认只做**检测与打分**；附带一个实验性栈重叠利用
+  （`ANTPWN_OFFBYNULL=1` 开启，成功与否取决于栈地址低字节能否落进缓冲区，不保证通用）
+- `ret2csu` 在“没有 pop rdi”的二进制上靠 one_gadget 收尾（需要本机装有 `one_gadget`）
 
 ---
 
