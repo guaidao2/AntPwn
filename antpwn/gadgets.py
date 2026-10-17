@@ -49,8 +49,12 @@ WANT32 = {
 
 
 class GadgetFinder:
+    _MAX_GADGET_LEN = 6      # bytes before the terminator
+    _MAX_PER_NAME = 24
+
     def __init__(self, elf):
         self.elf = elf
+        self._cache = None
 
     def exec_segments(self):
         for p in self.elf.phdrs:
@@ -58,6 +62,9 @@ class GadgetFinder:
                 yield p
 
     def find_all(self):
+        """fixed byte patterns + backtracking search around every `ret`"""
+        if self._cache is not None:
+            return self._cache
         gadgets = {}
         want = WANT if getattr(self.elf, "bits", 64) == 64 else WANT32
         for p in self.exec_segments():
@@ -72,7 +79,73 @@ class GadgetFinder:
                     addr = p.vaddr + i
                     gadgets.setdefault(name, []).append(
                         Gadget(addr, desc.split("; "), desc))
+            self._dynamic_scan(code, p.vaddr, gadgets)
+        self._cache = gadgets
         return gadgets
+
+    def _dynamic_scan(self, code, va, gadgets):
+        """find gadgets ending in `ret` by walking back 1..N bytes and
+        disassembling the window (catches pop rdi/rX compounds and
+        leave/syscall/int forms that the fixed byte table misses)"""
+        bits = getattr(self.elf, "bits", 64)
+        seen = {name: {g.addr for g in lst} for name, lst in gadgets.items()}
+        idx = 0
+        n = len(code)
+        while True:
+            idx = code.find(b"\xc3", idx)
+            if idx < 0:
+                break
+            for start in range(max(0, idx - self._MAX_GADGET_LEN), idx):
+                window = code[start:idx + 1]
+                try:
+                    insns = Disasm(window, va + start, bits).linear(len(window))
+                except Exception:
+                    continue
+                if not insns or insns[-1].mnem != "ret":
+                    continue
+                if sum(i.size for i in insns) != len(window):
+                    continue
+                if any(i.mnem.startswith(".byte") or i.mnem == "bad" for i in insns):
+                    continue
+                if len(insns) > 4:
+                    continue
+                parts = []
+                for ins in insns[:-1]:
+                    if ins.mnem == "pop" and len(ins.ops) == 1:
+                        parts.append(f"pop {ins.ops[0]}")
+                    elif ins.mnem == "leave":
+                        parts.append("leave")
+                    elif ins.mnem == "syscall":
+                        parts.append("syscall")
+                    elif ins.mnem == "int" and ins.ops and ins.ops[0] == "0x80":
+                        parts.append("int 0x80")
+                    else:
+                        parts = None
+                        break
+                if parts is None:
+                    continue
+                if not parts:
+                    name = "ret"
+                elif len(parts) == 1:
+                    name = "leave;ret" if parts[0] == "leave" else (
+                        "syscall;ret" if parts[0] == "syscall" else (
+                            "int 0x80;ret" if parts[0] == "int 0x80" else parts[0]))
+                elif all(part.startswith("pop ") for part in parts):
+                    # match the WANT naming convention: pop rdi / pop rsi;pop rbp
+                    name = ";".join(parts)
+                else:
+                    name = ";".join(parts) + ";ret"
+                addr = va + start
+                bucket = gadgets.setdefault(name, [])
+                if addr in seen.get(name, ()) or len(bucket) >= self._MAX_PER_NAME:
+                    continue
+                desc = color_desc = "; ".join(i.mnem + " " + ", ".join(i.ops)
+                                              for i in insns)
+                bucket.append(Gadget(addr, [d.strip() for d in desc.split("; ")], desc))
+                seen.setdefault(name, set()).add(addr)
+                if name == "ret":
+                    break
+            idx += 1
 
     def find(self, pattern):
         g = self.find_all()

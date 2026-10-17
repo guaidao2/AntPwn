@@ -350,6 +350,708 @@ class TestColorEnv(unittest.TestCase):
             self._reset()
 
 
+class TestHeapOverflowExploitGeometry(unittest.TestCase):
+    def test_chunk_step(self):
+        from antpwn.exploits import HeapMenu
+        self.assertEqual(HeapMenu._chunk_step(0x20, 64), 0x30)
+        self.assertEqual(HeapMenu._chunk_step(0x20, 32), 0x28)
+        self.assertEqual(HeapMenu._chunk_step(0x100, 64), 0x110)
+
+    def test_alloc_geometry_from_pseudo_lines(self):
+        import types
+        from antpwn.exploits import HeapMenu
+        elf = types.SimpleNamespace(strings=lambda minlen=1: [
+            (0x4000, "1. add"), (0x4008, "2. delete"), (0x4010, "3. show"),
+            (0x4020, "4. edit"), (0x4100, "data: "), (0x4110, "idx: "),
+            (0x4120, "> "),
+        ])
+        add_pf = types.SimpleNamespace(lines=[
+            (1, "v0 = malloc@plt(0x20);"),
+            (2, "read@plt(0, v0, 8);"),
+        ])
+        edit_pf = types.SimpleNamespace(lines=[
+            (3, "read@plt(0, v0, 0x80);"),
+        ])
+        ctx = types.SimpleNamespace(
+            bits=64, elf=elf,
+            scanner=types.SimpleNamespace(funcs={"add": add_pf, "edit": edit_pf}))
+        h = HeapMenu(ctx)
+        self.assertEqual(h._alloc_geometry(), (0x20, 0x80))
+
+
+class TestHeapOverflowScan(unittest.TestCase):
+    def _scan(self, lines):
+        import types
+        from antpwn.scanner import Scanner
+        sc = object.__new__(Scanner)
+        sc.findings = []
+        sc.funcs = {"main": types.SimpleNamespace(
+            addr=0x1000, var_decls=[],
+            lines=[(0x1000 + i, ln) for i, ln in enumerate(lines)])}
+        sc._scan_heap_overflow()
+        return [(f.kind, f.evidence) for f in sc.findings]
+
+    def test_constant_overflow_and_offbyone(self):
+        found = self._scan([
+            "v0 = malloc@plt(0x20);",
+            "read@plt(0, v0, 0x100);",
+            "v1 = malloc@plt(0x40);",
+            "read@plt(0, v1, 0x41);",
+        ])
+        kinds = [k for k, _ in found]
+        self.assertIn("heap_overflow", kinds)
+        self.assertIn("offbyone", kinds)
+
+    def test_matching_length_is_not_flagged(self):
+        found = self._scan([
+            "v0 = malloc@plt(0x20);",
+            "read@plt(0, v0, 0x20);",
+        ])
+        self.assertEqual(found, [])
+
+
+class TestScannerMore(unittest.TestCase):
+    def _scan_heap(self, lines):
+        import types
+        from antpwn.scanner import Scanner
+        sc = object.__new__(Scanner)
+        sc.findings = []
+        sc.funcs = {"main": types.SimpleNamespace(
+            addr=0x1000, var_decls=[],
+            lines=[(0x1000 + i, ln) for i, ln in enumerate(lines)])}
+        sc._scan_heap_overflow()
+        return [f.kind for f in sc.findings]
+
+    def test_strncpy_bounded_not_flagged(self):
+        self.assertEqual(self._scan_heap([
+            "v0 = malloc@plt(0x40);",
+            "strncpy@plt(v0, src, 0x20);",
+        ]), [])
+
+    def test_strncpy_unknown_length_flagged(self):
+        self.assertIn("heap_overflow", self._scan_heap([
+            "v0 = malloc@plt(0x20);",
+            "strncpy@plt(v0, src, v1);",
+        ]))
+
+    def test_indirect_bof_into_caller_stack_buffer(self):
+        import types
+        from antpwn.scanner import Scanner
+        sc = object.__new__(Scanner)
+        sc.findings = []
+        block = types.SimpleNamespace(
+            stmts=[("store", ("var", "dst"), ("reg", "rdi")),
+                   ("call", "strcpy@plt", [("var", "dst"), ("var", "src")])],
+            term=None)
+        sink = types.SimpleNamespace(ir=types.SimpleNamespace(blocks={0: block}),
+                                     calls=["strcpy@plt"], var_decls=[], lines=[])
+        caller = types.SimpleNamespace(
+            ir=None, calls=["copy_user@plt"], var_decls=["char buf[16];"],
+            lines=[(0x2000, "copy_user(buf);")], addr=0x2000)
+        sc.funcs = {"copy_user": sink, "main": caller}
+        sc._scan_indirect_bof()
+        self.assertTrue(any(f.kind == "bof" for f in sc.findings))
+
+    def test_indirect_bof_requires_stack_buffer(self):
+        import types
+        from antpwn.scanner import Scanner
+        sc = object.__new__(Scanner)
+        sc.findings = []
+        block = types.SimpleNamespace(
+            stmts=[("store", ("var", "dst"), ("reg", "rdi")),
+                   ("call", "strcpy@plt", [("var", "dst"), ("var", "src")])],
+            term=None)
+        sink = types.SimpleNamespace(ir=types.SimpleNamespace(blocks={0: block}),
+                                     calls=["strcpy@plt"], var_decls=[], lines=[])
+        caller = types.SimpleNamespace(ir=None, calls=["copy_user@plt"],
+                                       var_decls=[], lines=[(0x2000, "copy_user(p);")],
+                                       addr=0x2000)
+        sc.funcs = {"copy_user": sink, "main": caller}
+        sc._scan_indirect_bof()
+        self.assertEqual(sc.findings, [])
+
+
+class TestHeapMenuPolicy(unittest.TestCase):
+    def test_full_relro_is_rejected(self):
+        import types
+        from antpwn.exploits import HeapMenu
+        ctx = types.SimpleNamespace(
+            elf=types.SimpleNamespace(relro="full"),
+            scanner=types.SimpleNamespace(findings=[types.SimpleNamespace(kind="heap")]),
+            note=lambda *a: None, live={}, log=None)
+        h = object.__new__(HeapMenu)
+        h.ctx = ctx
+        self.assertFalse(h.feasible())
+
+
+class TestMenuDriver(unittest.TestCase):
+    def test_menu_parse_from_strings(self):
+        import types
+        from antpwn.exploits import MenuDriver
+        elf = types.SimpleNamespace(strings=lambda minlen=1: [
+            (0x4000, "1. add"), (0x4008, "2. delete"), (0x4012, "3. show"),
+            (0x401b, "4. edit"), (0x4024, "5. exit"),
+            (0x4100, "size: "), (0x4110, "data: "), (0x4120, "idx: "),
+            (0x4130, "choice: "), (0x4140, "> "),
+        ])
+        drv = MenuDriver(elf)
+        self.assertEqual(drv.opts.get("add"), b"1")
+        self.assertEqual(drv.opts.get("del"), b"2")
+        self.assertEqual(drv.opts.get("show"), b"3")
+        self.assertEqual(drv.opts.get("edit"), b"4")
+        self.assertEqual(drv.markers.get("size"), b"size:")
+        self.assertEqual(drv.markers.get("data"), b"data:")
+        self.assertEqual(drv.markers.get("idx"), b"idx:")
+        self.assertIn(drv.markers.get("menu"), (b"choice:", b">"))
+
+    def test_named_menu_prompt_wins_over_bare(self):
+        import types
+        from antpwn.exploits import MenuDriver
+        elf = types.SimpleNamespace(strings=lambda minlen=1: [
+            (0x4000, "1. add"), (0x4008, "2. delete"), (0x4010, "3. show"),
+            (0x4100, "size: "), (0x4110, "data: "), (0x4120, "idx: "),
+            (0x4130, "> "), (0x4140, "$ "), (0x4150, "choice: "),
+        ])
+        drv = MenuDriver(elf)
+        self.assertEqual(drv.markers.get("menu"), b"choice:")
+
+    def test_poison_chunk_is_pointer_sized(self):
+        import types
+        from antpwn.exploits import HeapMenu
+        for bits in (64, 32):
+            elf = types.SimpleNamespace(strings=lambda minlen=1: [
+                (0x4000, "1. add"), (0x4008, "2. delete"), (0x4010, "3. show"),
+                (0x4020, "4. edit"), (0x4100, "size: "), (0x4110, "data: "),
+                (0x4120, "idx: "), (0x4130, "> "),
+            ])
+            ctx = types.SimpleNamespace(bits=bits, elf=elf)
+            h = HeapMenu(ctx)
+            self.assertEqual(h.poison_size, 4 if bits == 32 else 8)
+
+    def test_safelink_roundtrip(self):
+        from antpwn.exploits import HeapMenu
+        for addr in (0x5555555596a0, 0x55d2c0a3b2a0, 0x5f0000123450):
+            mangled = addr ^ (addr >> 12)
+            self.assertEqual(HeapMenu._decode_safelink(mangled), addr)
+
+
+class TestScanReachability(unittest.TestCase):
+    def test_reachable_from_main(self):
+        import types
+        from antpwn.scanner import Scanner
+
+        def fn(addr, calls=()):
+            return types.SimpleNamespace(addr=addr, calls=list(calls))
+
+        sc = object.__new__(Scanner)
+        sc.funcs = {
+            "main": fn(0x1000, ["vuln"]),
+            "vuln": fn(0x1100, ["strcpy@plt"]),
+            "win": fn(0x1200),
+            "printf": fn(0x2000),
+        }
+        sc.elf = types.SimpleNamespace(entry=0x1000)
+        reachable = sc._compute_reachable()
+        self.assertIn("main", reachable)
+        self.assertIn("vuln", reachable)
+        # not called from user code and not the entry seed
+        self.assertNotIn("printf", reachable)
+
+
+class TestJumpTableParser(unittest.TestCase):
+    def test_relative_4byte_entries_map_options(self):
+        import struct
+        import types
+        from antpwn.exploits import MenuDriver
+
+        table = 0x4007
+        values = [-0x10, -0x20, -0x30, -0x40]   # relative to the table base
+        raw = b"".join(struct.pack("<i", v) for v in values)
+
+        def read(addr, n):
+            if table <= addr < table + len(raw):
+                return raw[addr - table:addr - table + n]
+            return b""
+
+        elf = types.SimpleNamespace(
+            strings=lambda minlen=1: [(0x1000, "1. alpha"), (0x1010, "2. beta"),
+                                      (0x1020, "3. gamma"), (0x1030, "4. delta")],
+            read=read, bits=64, entry=0,
+            code_symbols=lambda: [], sym_at=lambda a: None)
+        drv = MenuDriver(elf)
+        drv.option_numbers = {1, 2, 3, 4}
+        acts = ["add", "del", "show", "edit"]
+        seq = iter(acts)
+
+        def fake_effective(target, _elf, _funcs, _menu):
+            return next(seq)
+
+        drv._effective_handler = fake_effective
+        lea = types.SimpleNamespace(addr=0x100, size=7, mnem="lea",
+                                    ops=["rdx", "[rip+0x3f00]"])
+        mov = types.SimpleNamespace(addr=0x110, size=4, mnem="movsxd",
+                                    ops=["rax", "[rdx+rax*4]"])
+        jmp = types.SimpleNamespace(addr=0x114, size=2, mnem="jmp", ops=["rax"])
+        self.assertTrue(drv._infer_jump_table([lea, mov, jmp], elf, {}, None))
+        self.assertEqual(drv.opts.get("add"), b"1")
+        self.assertEqual(drv.opts.get("del"), b"2")
+        self.assertEqual(drv.opts.get("show"), b"3")
+        self.assertEqual(drv.opts.get("edit"), b"4")
+
+
+class TestJumpTablePairing(unittest.TestCase):
+    def _driver(self, acts, numbers):
+        import struct
+        import types
+        from antpwn.exploits import MenuDriver
+        table = 0x4007
+        raw = b"".join(struct.pack("<i", -(0x10 * (i + 1))) for i in range(len(acts)))
+
+        def read(addr, n):
+            if table <= addr < table + len(raw):
+                return raw[addr - table:addr - table + n]
+            return b""
+
+        elf = types.SimpleNamespace(
+            strings=lambda minlen=1: [(0x1000, "1. alpha")], read=read,
+            bits=64, entry=0, code_symbols=lambda: [], sym_at=lambda a: None)
+        drv = MenuDriver(elf)
+        drv.option_numbers = set(numbers)
+        seq = iter(acts)
+        drv._effective_handler = lambda *a: next(seq, None)
+        lea = types.SimpleNamespace(addr=0x100, size=7, mnem="lea",
+                                    ops=["rdx", "[rip+0x3f00]"])
+        mov = types.SimpleNamespace(addr=0x110, size=4, mnem="movsxd",
+                                    ops=["rax", "[rdx+rax*4]"])
+        jmp = types.SimpleNamespace(addr=0x114, size=2, mnem="jmp", ops=["rax"])
+        return drv, [lea, mov, jmp], elf
+
+    def test_unclassified_exit_keeps_option_alignment(self):
+        acts = ["add", "del", "show", "edit", None]
+        drv, insns, elf = self._driver(acts, [1, 2, 3, 4, 5])
+        self.assertTrue(drv._infer_jump_table(insns, elf, {}, None))
+        self.assertEqual(drv.opts.get("add"), b"1")
+        self.assertEqual(drv.opts.get("del"), b"2")
+        self.assertEqual(drv.opts.get("show"), b"3")
+        self.assertEqual(drv.opts.get("edit"), b"4")
+
+    def test_zero_exit_slot_maps_remaining_options(self):
+        acts = [None, "add", "del", "show", "edit"]
+        drv, insns, elf = self._driver(acts, [1, 2, 3, 4])
+        self.assertTrue(drv._infer_jump_table(insns, elf, {}, None))
+        self.assertEqual(drv.opts.get("add"), b"1")
+        self.assertEqual(drv.opts.get("del"), b"2")
+        self.assertEqual(drv.opts.get("show"), b"3")
+        self.assertEqual(drv.opts.get("edit"), b"4")
+
+
+class TestVerifyShell(unittest.TestCase):
+    """P0: verify_shell must prove execution, not echo reflection."""
+
+    class EchoTube:
+        def __init__(self):
+            self.out = b""
+
+        def send(self, data):
+            self.out = data          # printf(buffer) reflects the input verbatim
+
+        def recv(self, timeout=2.0):
+            return self.out
+
+    class ShellTube:
+        def __init__(self):
+            self.out = b""
+
+        def send(self, data):
+            if data.startswith(b"echo "):
+                self.out = data[5:].strip() + b"\n"
+
+        def recv(self, timeout=2.0):
+            return self.out
+
+    def _strategy(self):
+        import types
+        from antpwn.exploits import Ret2Text
+        s = object.__new__(Ret2Text)
+        s.ctx = types.SimpleNamespace(live={})
+        return s
+
+    def test_echo_reflection_is_rejected(self):
+        ok, _ = self._strategy().verify_shell(self.EchoTube())
+        self.assertFalse(ok)
+
+    def test_real_command_output_passes(self):
+        s = self._strategy()
+        ok, _ = s.verify_shell(self.ShellTube())
+        self.assertTrue(ok)
+        self.assertIn("shell_tube", s.ctx.live)
+
+
+class TestLeakScan(unittest.TestCase):
+    def _scanner(self, bits):
+        import types
+        from antpwn.exploits import Ret2Libc
+        s = object.__new__(Ret2Libc)
+        s.ctx = types.SimpleNamespace(bits=bits)
+        return s
+
+    def test_32bit_libc_pointer_scan(self):
+        import struct
+        s = self._scanner(32)
+        off = 0x80000
+        base = 0xF7D00000
+        resp = b"hi\n" + struct.pack("<I", base + off) + b"\n"
+        leak = s._leak_from(resp, off)
+        self.assertIsNotNone(leak)
+        self.assertEqual(leak[1], base)
+        self.assertIsNone(s._leak_from(b"hi\nno pointer here", off))
+
+    def test_64bit_libc_pointer_scan(self):
+        import struct
+        s = self._scanner(64)
+        off = 0x80000
+        base = 0x7F1234500000
+        resp = b"x" + struct.pack("<Q", base + off)
+        leak = s._leak_from(resp, off)
+        self.assertIsNotNone(leak)
+        self.assertEqual(leak[1], base)
+
+
+class TestPieRet2TextGate(unittest.TestCase):
+    def test_ret2text_declines_pie(self):
+        import types
+        from antpwn.exploits import Ret2Text
+        ctx = types.SimpleNamespace(elf=types.SimpleNamespace(is_pie=True))
+        s = object.__new__(Ret2Text)
+        s.ctx = ctx
+        self.assertFalse(s.feasible())
+
+
+class TestLibcOffsets(unittest.TestCase):
+    def test_arbitrary_leak_function_offsets(self):
+        import types
+        from antpwn.exploits import libc_offsets
+        syms = {"puts": 0x80000, "system": 0x50000, "free": 0x90000,
+                "printf": 0x60000, "read": 0x110000, "write": 0x120000}
+        libc = types.SimpleNamespace(
+            sym=lambda n: types.SimpleNamespace(value=syms[n]) if n in syms else None,
+            strings=lambda: [(0x1a0000, "/bin/sh")])
+        off = libc_offsets(libc)
+        self.assertEqual(off.get("write"), 0x120000)
+        self.assertEqual(off.get("system"), 0x50000)
+        self.assertEqual(off.get("/bin/sh"), 0x1a0000)
+
+
+class TestLibcLeakVariant(unittest.TestCase):
+    def _strategy(self, got, strings, regs):
+        import types
+        from antpwn.exploits import Ret2Libc
+        elf = types.SimpleNamespace(
+            got_map=lambda: dict(got), strings=lambda: list(strings),
+            bits=64)
+        ctx = types.SimpleNamespace(
+            bits=64, elf=elf,
+            pick_arg_gadget=lambda r: 0x400000 if r in regs else None)
+        s = Ret2Libc(ctx)
+        s.find_plt = lambda g: g + 0x10
+        return s
+
+    def test_write_variant_when_puts_missing(self):
+        s = self._strategy({"write": 0x404018}, [], ("rdi", "rsi", "rdx"))
+        variant = s.leak_variant()
+        self.assertIsNotNone(variant)
+        self.assertEqual(variant[0], "write")
+
+    def test_printf_requires_percent_s_string(self):
+        s = self._strategy({"printf": 0x404018}, [], ("rdi", "rsi"))
+        self.assertIsNone(s.leak_variant())
+        s = self._strategy({"printf": 0x404018}, [(0x1000, "%s")], ("rdi", "rsi"))
+        self.assertEqual(s.leak_variant()[0], "printf")
+
+    def test_puts_preferred(self):
+        s = self._strategy({"puts": 0x404018, "write": 0x404020},
+                           [], ("rdi", "rsi", "rdx"))
+        self.assertEqual(s.leak_variant()[0], "puts")
+
+
+class TestSafelinkDecode(unittest.TestCase):
+    def test_decode_fixed_point(self):
+        from antpwn.exploits import HeapMenu
+        chunk = 0x5555555596a0
+        mangled = chunk ^ (chunk >> 12)  # x == a ^ (a >> 12): the decoder's fixed point
+        self.assertEqual(HeapMenu._decode_safelink(mangled), chunk)
+
+    def test_reject_garbage(self):
+        from antpwn.exploits import HeapMenu
+        self.assertIsNone(HeapMenu._decode_safelink(0xFFFFFFFFFFFFFFFF))
+        self.assertIsNone(HeapMenu._decode_safelink(0x1234))
+
+
+class TestChunkStep(unittest.TestCase):
+    def test_chunk_step_alignment(self):
+        from antpwn.exploits import HeapMenu
+        self.assertEqual(HeapMenu._chunk_step(0x20, 64), 0x30)   # 0x20+8 -> 0x30
+        self.assertEqual(HeapMenu._chunk_step(0x18, 64), 0x20)   # min chunk
+        self.assertEqual(HeapMenu._chunk_step(0x20, 32), 0x28)   # 0x20+4 -> align8
+        self.assertEqual(HeapMenu._chunk_step(0x8, 32), 0x10)    # min chunk
+
+
+class TestHeapMenuHelpers(unittest.TestCase):
+    def test_plausible_heap_rejects_code_and_misalignment(self):
+        from antpwn.exploits import HeapMenu
+        self.assertTrue(HeapMenu._plausible_heap(0x5555555596a0))
+        self.assertTrue(HeapMenu._plausible_heap(0x80bc020))
+        self.assertFalse(HeapMenu._plausible_heap(0x555555555169))  # code pointer
+        self.assertFalse(HeapMenu._plausible_heap(0x1004))         # too low / unaligned
+
+
+class TestHeapAddressClassification(unittest.TestCase):
+    def test_dense_chunk_cluster_excludes_isolated_code_pointer(self):
+        from antpwn.exploits import HeapMenu
+        chunks = [0x5555555596a0, 0x5555555596d0, 0x555555559700]
+        code = 0x5555555551a0
+        picked = HeapMenu._heap_addrs(chunks + [code])
+        self.assertTrue(set(picked).issubset(set(chunks)))
+        self.assertNotIn(code, picked)
+
+    def test_pad_truncates_and_zero_fills(self):
+        from antpwn.exploits import HeapMenu
+        self.assertEqual(HeapMenu._pad(b"AB", 4), b"AB\x00\x00")
+        self.assertEqual(HeapMenu._pad(b"ABCD", 2), b"AB")
+        self.assertEqual(HeapMenu._pad(b"AB", None), b"AB")   # unknown length
+
+    def test_chunk_only_prints_do_not_derive_fake_pie_base(self):
+        import types
+        from antpwn.exploits import HeapMenu
+        elf = types.SimpleNamespace(
+            strings=lambda minlen=1: [(0x4000, "> ")], is_pie=True,
+            code_symbols=lambda: [types.SimpleNamespace(value=0x1169),
+                                  types.SimpleNamespace(value=0x1200)],
+            symbols=lambda: [])
+        ctx = types.SimpleNamespace(bits=64, elf=elf,
+                                    scanner=types.SimpleNamespace(funcs={}))
+        h = HeapMenu(ctx)
+        chunks = [0x25a0, 0x25d0, 0x2600]
+        data = b" ".join(f"{a:#x}".encode() for a in chunks)
+        self.assertIsNone(h._derive_pie_base(data))
+
+
+class TestHeapMenuPie(unittest.TestCase):
+    def test_derive_pie_base_from_printed_code_pointer(self):
+        import types
+        from antpwn.exploits import HeapMenu
+        elf = types.SimpleNamespace(
+            strings=lambda minlen=1: [(0x4000, "> ")],
+            is_pie=True,
+            code_symbols=lambda: [types.SimpleNamespace(value=0x1169),
+                                  types.SimpleNamespace(value=0x1200)],
+            symbols=lambda: [],
+        )
+        ctx = types.SimpleNamespace(bits=64, elf=elf,
+                                    scanner=types.SimpleNamespace(funcs={}))
+        h = HeapMenu(ctx)
+        base = 0x555555554000
+        data = f"win: {base + 0x1169:#x}\n> ".encode()
+        self.assertEqual(h._derive_pie_base(data), base)
+        # no code-like pointer -> cannot derive
+        self.assertIsNone(h._derive_pie_base(b"chunk[0] @ 0x00ff1234\n> "))
+
+
+class TestJumpTableMenu(unittest.TestCase):
+    def test_imm_before_call(self):
+        import types
+        from antpwn.exploits import HeapMenu
+
+        def ins(mnem, *ops):
+            return types.SimpleNamespace(mnem=mnem, ops=list(ops))
+
+        insns = [
+            ins("mov", "edi", "0x20"),
+            ins("mov", "rsi", "rsp"),
+            ins("call", "0x401080"),
+        ]
+        self.assertEqual(HeapMenu._imm_before(insns, 2, ("edi", "rdi")), 0x20)
+        self.assertIsNone(HeapMenu._imm_before(insns, 2, ("edx", "rdx")))
+
+    def test_option_numbers_ignore_stray_fragments(self):
+        import types
+        from antpwn.exploits import MenuDriver
+        elf = types.SimpleNamespace(strings=lambda minlen=1: [
+            (0x4000, "1. alpha"), (0x4008, "2. beta"), (0x4010, "9. exit"),
+            (0x4020, "chunk[%d] @ %p"), (0x4030, "64. stray"),
+            (0x4100, "idx: "), (0x4110, "> "),
+        ])
+        drv = MenuDriver(elf)
+        self.assertIn(1, drv.option_numbers)
+        self.assertIn(9, drv.option_numbers)
+        self.assertNotIn(64, drv.option_numbers)
+
+
+class TestMenuDispatchInference(unittest.TestCase):
+    def test_classify_handler_by_calls(self):
+        import types
+        from antpwn.exploits import MenuDriver
+        cases = {
+            "add": ["malloc@plt", "read@plt"],
+            "del": ["free@plt"],
+            "show": ["write@plt", "printf@plt"],
+            "edit": ["read@plt", "scanf@plt"],
+        }
+        for want, calls in cases.items():
+            pf = types.SimpleNamespace(calls=calls)
+            self.assertEqual(MenuDriver._classify_handler(pf), want)
+
+    def test_resolve_handler_uses_next_function_bound(self):
+        import types
+        from antpwn.exploits import MenuDriver
+        funcs = {
+            "f1": types.SimpleNamespace(addr=0x1000, calls=[]),
+            "f2": types.SimpleNamespace(addr=0x1100, calls=["malloc@plt"]),
+            "f3": types.SimpleNamespace(addr=0x1200, calls=["free@plt"]),
+        }
+        elf = types.SimpleNamespace(sym_at=lambda a: None)
+        drv = MenuDriver(types.SimpleNamespace(strings=lambda minlen=1: []))
+        name, pf = drv._resolve_handler(0x1150, elf, funcs)
+        self.assertEqual(name, "f2")
+        self.assertIs(pf, funcs["f2"])
+
+    def test_short_words_do_not_substring_match(self):
+        import types
+        from antpwn.exploits import MenuDriver
+        elf = types.SimpleNamespace(strings=lambda minlen=1: [
+            (0x4000, "1. alpha"), (0x4008, "2. beta"), (0x4010, "3. gamma"),
+            (0x4018, "4. delta"), (0x4100, "idx: "), (0x4110, "> "),
+        ])
+        drv = MenuDriver(elf)
+        self.assertNotIn("del", drv.opts)
+
+
+class TestArgGadgetChain(unittest.TestCase):
+    def _ctx(self, gadgets):
+        import struct
+        import types
+        from antpwn.exploits import ExploitContext
+        ctx = object.__new__(ExploitContext)
+        ctx.bits = 64
+        bucket = {}
+        for name, addr in gadgets.items():
+            bucket[name] = [types.SimpleNamespace(addr=addr)]
+        ctx.gadgets = types.SimpleNamespace(find_all=lambda: bucket)
+        ctx.pack = lambda v: struct.pack("<Q", v)
+        return ctx
+
+    def test_exact_pop(self):
+        ctx = self._ctx({"pop rdi": 0x401001})
+        parts = []
+        self.assertTrue(ctx.chain_set(parts, "rdi", 0x4141))
+        self.assertEqual(parts, [b"\x01\x10\x40\x00\x00\x00\x00\x00",
+                                 b"AA\x00\x00\x00\x00\x00\x00"])
+
+    def test_compound_pop_adds_padding(self):
+        ctx = self._ctx({"pop rdi;pop rbp": 0x401002})
+        parts = []
+        self.assertTrue(ctx.chain_set(parts, "rdi", 0x4141))
+        self.assertEqual(len(parts), 3)
+        self.assertEqual(int.from_bytes(parts[-1], "little"), 0)
+
+    def test_no_gadget(self):
+        ctx = self._ctx({})
+        self.assertFalse(ctx.chain_set([], "rdi", 1))
+
+
+class TestPartialPie(unittest.TestCase):
+    def test_partial_payload_length_and_bytes(self):
+        from antpwn.exploits import cyclic
+        payload = cyclic(72) + (0x1169).to_bytes(2, "little")
+        self.assertEqual(len(payload), 74)
+        self.assertEqual(payload[72:], b"\x69\x11")
+
+    def test_one_byte_payload(self):
+        from antpwn.exploits import cyclic
+        payload = cyclic(72) + (0x116d & 0xFF).to_bytes(1, "little")
+        self.assertEqual(payload[72:], b"\x6d")
+
+    def test_menu_driver_obscure_action_words(self):
+        import types
+        from antpwn.exploits import MenuDriver
+        elf = types.SimpleNamespace(strings=lambda minlen=1: [
+            (0x4000, "1. create"), (0x4008, "2. destroy"), (0x4010, "3. dump"),
+            (0x4018, "4. update"), (0x4100, "idx: "), (0x4110, "data: "),
+            (0x4120, "> "),
+        ])
+        drv = MenuDriver(elf)
+        self.assertEqual(drv.opts.get("add"), b"1")
+        self.assertEqual(drv.opts.get("del"), b"2")
+        self.assertEqual(drv.opts.get("show"), b"3")
+        self.assertEqual(drv.opts.get("edit"), b"4")
+
+
+class TestShellcodeCandidates(unittest.TestCase):
+    def test_stack_like_addresses_come_first(self):
+        from antpwn.exploits import Shellcode
+        cands = Shellcode._stack_candidates(
+            [0x4141414141414141, 0x555555559000, 0x7FFC12345000], 64)
+        self.assertEqual(cands[0], 0x7FFC12345000)
+        self.assertIn(0x555555559000, cands)
+
+    def test_32bit_stack_range(self):
+        from antpwn.exploits import Shellcode
+        cands = Shellcode._stack_candidates([0x0804A000, 0xFFAABBCC], 32)
+        self.assertEqual(cands[0], 0xFFAABBCC)
+        self.assertIn(0x0804A000, cands)
+
+    def test_rejects_non_addresses(self):
+        from antpwn.exploits import Shellcode
+        self.assertEqual(Shellcode._stack_candidates([0, 0x10, 0x1234], 64), [])
+
+
+class TestPieBaseDerivation(unittest.TestCase):
+    def test_derive_from_any_printed_code_pointer(self):
+        from antpwn.exploits import LeakedWin
+        base = 0x555555554000
+        win_off = 0x1169
+        printed_main = base + 0x1200
+        self.assertEqual(
+            LeakedWin._derive_win([printed_main], win_off, [0x1200]),
+            base + win_off)
+        # a direct win address still wins immediately
+        self.assertEqual(LeakedWin._derive_win([base + win_off], win_off, []),
+                         base + win_off)
+        # no consistent page-aligned base -> no guess
+        self.assertIsNone(LeakedWin._derive_win([0x12345678], win_off, [0x1200]))
+
+
+class TestFmtPayload(unittest.TestCase):
+    def test_64bit_payload_contains_all_halves(self):
+        from antpwn.exploits import FmtGOT
+        payload = FmtGOT.fmt_payload(6, 0x404018, 0x7ffff7c12345, bits=64)
+        self.assertIn(b"$hn", payload)
+        for off in (0, 2, 4, 6):
+            self.assertIn((0x404018 + off).to_bytes(8, "little"), payload)
+
+    def test_32bit_payload_only_two_halves(self):
+        from antpwn.exploits import FmtGOT
+        payload = FmtGOT.fmt_payload(6, 0x804a010, 0xf7e12345, bits=32)
+        self.assertIn(b"$hn", payload)
+        for off in (0, 2):
+            self.assertIn((0x804a010 + off).to_bytes(4, "little"), payload)
+        self.assertEqual(payload.count(b"$hn"), 2)
+
+
+class TestPtyTube(unittest.TestCase):
+    def test_pty_tube_reads_line_buffered_output(self):
+        import sys
+        if not sys.platform.startswith("linux"):
+            self.skipTest("pty tube is POSIX-only")
+        from antpwn.procio import Tube
+        tube = Tube("/bin/echo", ["hello-pty"], pty=True)
+        try:
+            out = tube.recv_until(b"hello-pty", timeout=2.0)
+            self.assertIn(b"hello-pty", out)
+        finally:
+            tube.close()
+
+
 class TestGdbLoader(unittest.TestCase):
     def test_snippet(self):
         from antpwn import gdb_loader
@@ -603,7 +1305,7 @@ class TestI386(unittest.TestCase):
         fsm.scanner = Scanner(elf)
         ctx = ExploitContext(elf, fsm.scanner, GadgetFinder(elf), None)
         edges = {e.name: e for e in fsm.build_edges(ctx)}
-        for name in ("fmt-k", "fmt-backdoor", "fmt-leak", "heap-leak"):
+        for name in ("fmt-k", "fmt-backdoor", "fmt-leak"):
             self.assertIn(name, edges)
             self.assertFalse(edges[name].feasible(ctx),
                              f"{name} must be blocked on i386")
@@ -616,6 +1318,57 @@ class TestI386(unittest.TestCase):
         text = dec.render(dec.function(elf.sym("demo")))
         self.assertIn("sink(0x41)", text)
         self.assertNotIn("sink(0x41, ebx)", text)
+
+    def test_i386_accumulator_immediates(self):
+        from antpwn.disasm import Disasm
+        from antpwn import ELF
+        # 05 00 00 00 00 = add eax, 0 (PIC thunk sequence that used to desync)
+        ins = Disasm(b"\x05\x00\x00\x00\x00", 0x1000, 32).decode_one(0)
+        self.assertEqual(ins.mnem, "add")
+        self.assertEqual(ins.size, 5)
+        self.assertEqual(ins.ops[0], "eax")
+        # static binaries: libc names must not be treated as canary
+        elf = ELF(self.bins["i386_bof"])
+        self.assertFalse(elf.canary)
+
+    def test_callee_name_normalisation(self):
+        from antpwn.scanner import callee_base
+        self.assertEqual(callee_base("_IO_gets"), "gets")
+        self.assertEqual(callee_base("__libc_system"), "system")
+        self.assertEqual(callee_base("__isoc99_scanf@plt"), "scanf")
+        self.assertEqual(callee_base("read@plt"), "read")
+        self.assertEqual(callee_base("getshell"), "getshell")
+
+    def test_dynamic_gadget_backtracking(self):
+        import types
+        from antpwn.gadgets import GadgetFinder
+        code = (b"\x90" * 8 +
+                b"\x5f\xc3" +          # pop rdi; ret
+                b"\x5e\x5d\xc3" +    # pop rsi; pop rbp; ret
+                b"\x0f\x05\xc3" +    # syscall; ret
+                b"\xc9\xc3")           # leave; ret
+        fake = types.SimpleNamespace(
+            bits=64, data=code,
+            phdrs=[types.SimpleNamespace(type=1, flags=1, off=0,
+                                          filesz=len(code), vaddr=0x1000)],
+        )
+        g = GadgetFinder(fake).find_all()
+        self.assertIn("pop rdi", g)
+        self.assertIn("pop rsi;pop rbp", g)
+        self.assertIn("syscall;ret", g)
+        self.assertIn("leave;ret", g)
+        self.assertEqual(g["pop rdi"][0].addr, 0x1008)
+
+    def test_newline_safe_gadget(self):
+        from antpwn import ELF, GadgetFinder, Scanner
+        from antpwn.exploits import ExploitContext
+        elf = ELF(self.bins["i386_bof"])
+        ctx = ExploitContext(elf, Scanner(elf), GadgetFinder(elf), None)
+        picks = [cand.addr for cand in ctx.gadgets.find_all().get("ret", [])]
+        self.assertTrue(picks)
+        safe = ctx.pick_gadget("ret", avoid_newline=True)
+        self.assertIsNotNone(safe)
+        self.assertNotIn(b"\n", ctx.pack(safe))
 
     def test_i386_inc_dec_decode(self):
         from antpwn.disasm import Disasm
@@ -658,11 +1411,12 @@ class TestI386(unittest.TestCase):
 
     def test_arch_guards(self):
         from antpwn import ELF, Scanner, GadgetFinder
-        from antpwn.exploits import ExploitContext, FmtGOT, HeapUAF, Ret2Text
+        from antpwn.exploits import ExploitContext, FmtGOT, HeapMenu, Ret2Text
         elf = ELF(self.bins["i386_bof"])
         ctx = ExploitContext(elf, Scanner(elf), GadgetFinder(elf), None)
-        self.assertFalse(FmtGOT(ctx).supported())
-        self.assertFalse(HeapUAF(ctx).supported())
+        self.assertTrue(FmtGOT(ctx).supported())  # fmt now supports i386
+        self.assertIn(32, FmtGOT.BITS)
+        self.assertFalse(HeapMenu(ctx).supported())
         self.assertTrue(Ret2Text(ctx).supported())
         from antpwn.exploits import Ret2OneGadget
         self.assertFalse(Ret2OneGadget(ctx).supported())

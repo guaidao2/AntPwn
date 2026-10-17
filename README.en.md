@@ -4,7 +4,7 @@
 
 > by guaidao2 · coolmoon
 
-**author: guaidao2** · version 1.7.1 · bilingual (zh / en)
+**author: guaidao2** · version 1.7.2 · bilingual (zh / en)
 
 > Native static analysis · pseudo-code recovery · vulnerability scanning · ptrace debugging ·
 > capability-DAG planning · state-machine driven
@@ -38,11 +38,11 @@ containers and can be imported as a library into your own toolchain.
 |---|---|
 | Static analysis | Native ELF32/ELF64 parsing: PIE / NX / Canary / RELRO / ExecStack detection, symbols, PLT/GOT, relocations |
 | Pseudo-code | own disassembler → P-code-like IR → CFG/dominators/natural loops → dataflow simplification → structured recovery (if/else, while, do-while), emitted as syntax-highlighted C-like pseudo-code: `while (1) { menu(); if (fgets@plt(v0, 0x20, stdin) == 0) break; ... }` |
-| Vulnerability scan | Rule engine plus pattern matching: stack overflow / format string / UAF / backdoor functions / dangerous strings, severity-scored |
+| Vulnerability scan | Rule engine plus pattern matching: stack overflow / format string / UAF / backdoor functions / heap overflows (including off-by-one) / dangerous strings, severity-scored; ranked by call-graph reachability from main (user code first) with duplicate findings collapsed so large binaries stay readable |
 | Dynamic debugging | ctypes-ptrace debugger: software breakpoints, single step, register and memory access, crash-site analysis |
 | Planning | Capability DAG + decision tree + ant colony: capabilities are scoped session/process, capabilities left by failed ants are reused, offsets are inferred by crash forensics, pheromone persists per binary signature |
 | State machine | RECON → DECOMPILE → SCAN → STRATEGY → OFFSET → BUILD → TEST → VERIFY, every step explained in plain words |
-| Auto verification | 8 userland strategies, selected by behaviour rather than function names; a successful run gives an interactive shell, used to verify the judgement, not to do your job for you |
+| Auto verification | multiple userland strategies (8 core + conditional/experimental), selected by behaviour rather than function names; a successful run gives an interactive shell, used to verify the judgement, not to do your job for you |
 | Failure diagnosis | When a strategy is not feasible it says why: missing gadget, no leak channel, where PIE or Canary blocks the chain, and what to try next |
 | Flag capture | After getting a shell it runs `id` / `pwd` / `ls` / `cat flag*` etc. and prints the first `flag{...}`-shaped match |
 | Remote targets | `--remote HOST:PORT`: the local binary is used for analysis, the exploit traffic goes over TCP, same DAG/strategies |
@@ -76,11 +76,15 @@ chooses to explain the process and leave the last mile to the human.
 1. **ret2text** — detect a backdoor function (behaviour: `system("/bin/sh")`, or a suspicious symbol name)
 2. **ret2libc** — leak `puts@GOT` → compute libc base → return into the vulnerable function again → `system("/bin/sh")`
 3. **ret2syscall** — ROP chain that sets up registers → `execve("/bin/sh",0,0)`
-4. **Format string** — `%p` spray locates the argument index dynamically; with a backdoor, `%hn` overwrites the GOT, **without one, `%s` leaks libc → printf@GOT→system** (generic route)
-5. **shellcode** — ExecStack + `jmp rsp`
+4. **Format string** — bits-aware `%p` spray for the argument index, automatic detection of interaction rounds and of any printf call after our input; `%hn` GOT overwrite with a backdoor, `%s` libc leak + printf→system without one, and an explicit diagnosis for single-round targets with no trigger point — `%p` spray locates the argument index dynamically; with a backdoor, `%hn` overwrites the GOT, **without one, `%s` leaks libc → printf@GOT→system** (generic route)
+5. **shellcode** — ExecStack + stack-jump gadgets such as `jmp rsp`/`call rsp`; when no gadget exists, reuse a buffer address printed by the same process (validated, stack-like first), for both 64- and 32-bit targets
 6. **SROP** — forged sigreturn frame
 7. **Stack pivot** — small overflow + `leave;ret` into bss
 8. **Heap (UAF)** — two UAF reads recover exact safe-linking chunk addresses → tcache poisoning into a function-pointer array → forge a slot → leak libc → `free@GOT = system`
+9. **leaked-win / PIE** — derive the PIE base from any printed code pointer by matching known function offsets, then ret2win (not limited to printing win); with no leak at all, try a partial overwrite of the saved return address's low 1-2 bytes (enumerating the 16 possible page carries of the base)
+10. **generic heap menu (heap_menu)** — option numbers come from the `cmp/je` dispatch chain and are mapped to handlers, which are classified by their own calls (malloc/free/write/read) into add/del/show/edit, so arbitrary labels or even stripped binaries work; leak path by capability (printed address / raw show bytes / double-free safe-linking iteration; under PIE a printed code pointer is used to recover the base first) / raw show bytes / double-free safe-linking iteration) and GOT target from got_map, with no challenge-specific hard-coding
+
+- Argument loading in stack strategies goes through `pick_arg_gadget` / `chain_set`: compound gadgets are used with automatic padding when the canonical single-pop gadget is missing (shared by ret2libc / ret2syscall / ret2dlresolve)
 
 ## Quick Start
 
@@ -147,7 +151,8 @@ scan = Scanner(elf); scan.scan()     # vulnerability scan (bof/fmt/heap/backdoor
 gf   = GadgetFinder(elf)
 rdi  = gf.first("pop rdi")           # address of the first pop rdi, None if absent
 proc = Process("./vuln"); proc.start()
-proc.send(b"AAAA\n"); proc.cont()   # ptrace: registers/memory/breakpoints
+proc.send(b"AAAA
+"); proc.cont()   # ptrace: registers/memory/breakpoints
 regs = proc.getregs(); mem = proc.read_mem(regs.rsp, 0x40)
 
 fsm = FSM("./vuln")                  # decision tree x ant colony x capability DAG
@@ -212,7 +217,7 @@ AntPwn/
 
 ## Limitations
 
-- Static analysis and decompilation cover ELF64 / x86-64 and ELF32 / i386; 32-bit exploitation covers ret2text, ret2syscall (int 0x80), shellcode and the cdecl ret2libc two-stage chain; fmt / heap / SROP / pivot are 64-bit only (not implemented for i386)
+- Static analysis and decompilation cover ELF64 / x86-64 and ELF32 / i386; 32-bit exploitation covers ret2text, ret2syscall (int 0x80), shellcode and the cdecl ret2libc two-stage chain (puts or write leaks); fmt now supports both 32- and 64-bit (automatically avoiding newline bytes that would break line input); heap / SROP / pivot remain 64-bit only
   linked targets are not covered yet
 - `antpwn_pheromone.json` is a learning artefact (edge statistics keyed by binary features);
   delete it to reset the experience
@@ -232,6 +237,7 @@ AntPwn/
   optional `one_gadget` tool installed locally)
 - the gdb plugin does not run exploits or brute-force loops; remote targets are best served
   by the CLI, and static/musl targets are reported as "no libc mapping" by `plan`
+- Time budget: `ANTPWN_MAX_SECONDS` (default 900s, 0 disables) caps the total time of one automatic run; PIE partial-overwrite brute force and heap-menu multi-path attempts stop early with a diagnosis when it expires
 
 ---
 

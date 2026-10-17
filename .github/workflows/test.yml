@@ -88,6 +88,30 @@ jobs:
           set -eu
           python3 -m unittest discover -s tests -v
 
+      - name: Docs sanity (no collapsed README / literal \\n)
+        run: |
+          set -eu
+          for f in README.md README.en.md; do
+            lines=$(wc -l < "$f")
+            test "$lines" -ge 50 || { echo "$f looks collapsed ($lines lines)"; exit 1; }
+            if grep -q '\\n' "$f"; then echo "$f contains literal backslash-n"; exit 1; fi
+          done
+          for f in docs/API.md docs/API.en.md; do
+            test -s "$f"
+                      python3 - "$f" <<'PY'
+          import sys
+          text = open(sys.argv[1], encoding="utf-8").read()
+          for probe in ("find_all()", "ret"):
+              assert probe in text, (sys.argv[1], probe)
+          PY
+          done
+
+      - name: Fixture smokes (heap menu + 32-bit when gcc -m32 is present)
+        run: |
+          set -eu
+          bash tests/fixtures/smoke_heap_menu.sh
+          bash tests/fixtures/smoke_i386.sh
+
       - name: GDB plugin smoke (real inferior, needs gdb)
         run: |
           set -eu

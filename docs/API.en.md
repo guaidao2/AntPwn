@@ -2,7 +2,7 @@
 
 [中文](API.md) | **English**
 
-Version: AntPwn v1.7.1
+Version: AntPwn v1.7.2
 Platform: Linux (x86-64 kernel; 32-bit i386 targets can be analysed), Python 3.9+ (developed and verified on 3.11 and 3.14)
 Dependencies: none (standard library only)
 
@@ -284,6 +284,8 @@ scanner.summary()                # Counter({kind: count})
 | `fmt` | format string | 9 |
 | `flag` | possible flag string | 9 |
 | `heap` | UAF / double-free hint | 8 |
+| `heap_overflow` | fixed-size write past malloc | 8 |
+| `offbyone` | heap off-by-one | 6 |
 | `exec_stack` | executable stack | 8 |
 | `no_canary` / `no_pie` | missing mitigation | 5 / 4 |
 | `sh_string` | `/bin/sh`-style string | 3 |
@@ -319,18 +321,22 @@ Available names (`WANT` table): `pop rdi`, `pop rsi`, `pop rdx`, `pop rax`, `pop
 
 `Gadget`: `addr`, `insns` (list of instruction texts), `effect` (description).
 
-This is a **targeted scan** (fixed byte patterns inside executable segments), not a full gadget
-database: it covers the common entries AntPwn's own strategies need. For a complete gadget list
-use ROPgadget alongside it.
+Beyond the fixed byte table, `find_all()` backtracks 1-6 bytes from every `ret` and names
+compound pops (pop rdi;pop rbp), leave;ret, syscall;ret, etc. Strategies call
+ctx.pick_arg_gadget(reg) and automatically fall back to a compound gadget with padding when the
+canonical single-pop gadget is absent.
 
 ---
+
+Scan results are ranked by call-graph reachability from main (user code first); `scanner.reachable` is exposed for callers that want to filter. The CLI collapses duplicate findings on the first screen; use `--json` for the full list.
 
 ## 7. `antpwn.procio` — process interaction (no debugger)
 
 ```python
 from antpwn.procio import Tube
 
-t = Tube(path, argv=None, env=None)     # pipe-based child; stderr merged into stdout
+t = Tube(path, argv=None, env=None, pty=False)  # pty=True gives a pty so printf is
+                                                # line-buffered (targets printing stack addrs need it)
 with Tube(path) as t:
     ...
 ```
@@ -617,11 +623,13 @@ All strategies subclass `Strategy` and implement `feasible()` and `run()` (retur
 | `Ret2Text` | jump to a backdoor function |
 | `Ret2Libc` | leak puts → compute base → second return into system |
 | `Ret2Syscall` | ROP chain for execve |
-| `FmtGOT` | format string (with backdoor `%hn` / without, `%s` libc leak) |
-| `Shellcode` | executable-stack injection |
+| `FmtGOT` | format string (auto argument index and interaction rounds; `%hn` with a backdoor, `%s` libc leak without one; explicit diagnosis for single-round targets without a trigger) |
+| `Shellcode` | executable-stack injection (jmp/call-sp gadget, or a buffer address leaked by the same process; 64/32-bit) |
 | `SROP` | sigreturn frame |
 | `StackPivot` | stack pivot |
 | `HeapUAF` | tcache poisoning |
+| `MenuDriver` | infers menu options/prompts from strings and answers adaptively; maps option numbers to handlers via the `cmp/je` dispatch chain or a switch jump table (absolute 8-byte / relative 4-byte entries); the dispatch function is not assumed to be main (functions with scanf/read/fgets calls are scanned first) and classifies handlers by their own calls (malloc/free/write/read), so arbitrary labels or stripped binaries work |
+| `HeapMenu` | generic UAF/tcache menu exploitation: capability-driven leak paths + automatic GOT targets; under PIE, a printed code pointer is used to recover the base before poisoning the GOT; pointer-sized poisoning chunks keep GOT neighbours intact; also poisons a freed neighbour's tcache fd via a heap overflow from an allocated chunk (menu-style heap overflow, requires a printed chunk address) |
 | `Ret2OneGadget` | leak libc, then jump to a one_gadget (when plain ret2libc does not apply) |
 | `Ret2CsuOneGadget` | no `pop rdi`: `__libc_csu_init` leak + one_gadget |
 | `Ret2Dlresolve` | fake Elf64 rela/sym/strtab resolved through plt0 (no libc needed) |
@@ -828,7 +836,9 @@ route and only want AntPwn's probing and sending logic.
 
 - **Platform**: Linux (x86-64 kernel, can trace 32-bit processes). `debugger` loads `libc.so.6` at import time, so even
   `import antpwn` fails on Windows/macOS.
-- **32-bit**: static analysis, decompilation, ptrace debugging and ret2text/ret2syscall/shellcode exploitation are supported (`Process` exposes eip/esp/ebp); fmt / heap / SROP / pivot are 64-bit only (not implemented for i386); the i386 cdecl ret2libc chain is end-to-end verified (Kali ships /lib32/libc).
+- **32-bit**: static analysis, decompilation, ptrace debugging and ret2text/ret2syscall/shellcode exploitation are supported (`Process` exposes eip/esp/ebp); fmt supports 32- and 64-bit (automatic trigger-GOT selection and newline-byte avoidance; the no-backdoor %s->libc path is verified on i386 via i386_fmt_libc, and when the GOT address contains a newline but the high 16 bits already agree it degrades to a single %hn partial write); heap / SROP / pivot are 64-bit only; the i386 cdecl ret2libc chain is end-to-end verified (Kali ships /lib32/libc; puts or write(1,got,4) leaks).
+
+- **Time budget**: `ANTPWN_MAX_SECONDS` (default 900, 0 disables) caps one automatic run; when it expires the remaining strategies stop with a diagnosis.
 - **Global state**: `i18n.LANG` is module-level, so concurrent tasks in one process affect each
   other's language.
 - **Pheromone file**: written to `antpwn_pheromone.json` in the current working directory by

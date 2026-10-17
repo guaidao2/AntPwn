@@ -186,7 +186,7 @@ class FSM:
         arch_blocked = [s.name for s in strategies if not s.supported()]
         candidates = [s for s in strategies if s.supported() and s.feasible()]
         # order: specific before generic
-        prio = {"fmt": 0, "heap": 1, "ret2text": 2, "pivot": 3, "srop": 4,
+        prio = {"fmt": 0, "heap": 1, "ret2text": 2, "leaked_win": 2, "pivot": 3, "srop": 4,
                 "ret2libc": 5, "one_gadget": 5, "ret2csu": 6, "ret2dlresolve": 6,
                 "ret2syscall": 6, "shellcode": 7, "canary_brute": 8,
                 "offbynull": 9}
@@ -206,14 +206,20 @@ class FSM:
             self._explain_no_strategy()
 
         for strat in candidates:
+            if getattr(ctx, "expired", lambda: False)():
+                ctx.note(
+                    "总时限 ANTPWN_MAX_SECONDS 已到，停止后续策略",
+                    "global time budget ANTPWN_MAX_SECONDS exhausted; stopping strategies")
+                break
             self.state = State.STRATEGY
             tried.append(strat.name)
             self.log.log(State.STRATEGY, f"==> {i18n.t(strat.key)}",
                          styled=color.style(f"==> {i18n.t(strat.key)}", "bold", "bright_cyan"))
             self.report_data["steps"].append(f"strategy: {strat.name}")
             # ---- OFFSET via ACO (stack strategies only) ----
-            if strat.name in ("ret2text", "ret2libc", "ret2syscall",
-                              "shellcode", "srop", "pivot"):
+            if strat.name in ("ret2text", "leaked_win", "partial_pie", "ret2libc",
+                              "ret2syscall", "ret2dlresolve", "one_gadget",
+                              "ret2csu", "shellcode", "srop", "pivot"):
                 if ctx.offset is None:
                     ok = self.find_offset(strat)
                     if not ok:
@@ -242,6 +248,19 @@ class FSM:
                 self.log.raw(f"    [x] {i18n.t('failed')} (strategy={strat.name})")
                 ctx.offset = None  # offset may differ per strategy
         self.state = State.FAILED
+        already = ctx.live.get("diagnosed", set())
+        cues = ("不可行", "无法", "缺少", "缺 gadget", "缺少可用", "失败", "不支持", "拒绝")
+        for zh, en in ctx.notes[-6:]:
+            if zh in already:
+                continue
+            low = (zh + " " + en).lower()
+            if not (any(c in zh for c in cues) or any(c in low for c in
+                       ("cannot", "not exploitable", "no usable", "missing",
+                        "refusing"))):
+                continue
+            msg = zh if i18n.LANG == "zh" else en
+            self.log.raw("    诊断: " + msg)
+            already.add(zh)
         self.report_data["result"] = "failed"
         self.report_data["notes"] = ctx.notes
         self.report_data["tried"] = tried
@@ -396,7 +415,7 @@ class FSM:
     def build_edges(self, ctx):
         """wire the capability DAG: techniques are edges, strategies become
         single-shot or staged edge executors"""
-        from .exploits import (Ret2Text, Ret2Libc, Ret2Syscall, FmtGOT,
+        from .exploits import (Ret2Text, LeakedWin, PartialPIE, Ret2Libc, Ret2Syscall, FmtGOT,
                                Shellcode, SROP, StackPivot, HeapUAF,
                                Ret2OneGadget, Ret2CsuOneGadget, Ret2Dlresolve,
                                CanaryBrute, OffByNull)
@@ -481,6 +500,16 @@ class FSM:
                       and not c.elf.is_pie and not c.elf.canary,
                       prio=1, zh="跳转到程序自带后门函数",
                       en="jump to the binary's own backdoor"),
+            Technique("leaked-win", [CAP_RIP], [CAP_SHELL],
+                      lambda c, _s=LeakedWin(ctx): _s.run(),
+                      feasible=lambda c, _s=LeakedWin(ctx): _s.supported() and _s.feasible(),
+                      prio=2, zh="用程序打印的 win 地址绕 PIE",
+                      en="use the printed win address to bypass PIE"),
+            Technique("partial-pie", [CAP_RIP], [CAP_SHELL],
+                      lambda c, _s=PartialPIE(ctx): _s.run(),
+                      feasible=lambda c, _s=PartialPIE(ctx): _s.supported() and _s.feasible(),
+                      prio=2, zh="PIE 无泄露时部分覆盖返回地址低字节",
+                      en="partial low-byte overwrite when PIE has no leak"),
             Technique("heap-leak", [], [CAP_HEAP], lambda c: heap.stage_heap_leak(),
                       feasible=lambda c, _s=heap: _s.supported() and "heap" in c.vuln_kinds,
                       scope=PROCESS,

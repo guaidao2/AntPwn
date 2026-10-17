@@ -251,8 +251,19 @@ class Disasm:
                 return self.R[rm + (rex_b << 3)]
             return self._modrm_mem(cur, rex_b, rex_x)
 
+        # ---- accumulator-immediate forms: 04/05, 0c/0d, ... 3c/3d ----
+        if b < 0x40 and (b & 7) in (4, 5) and (b >> 3) < 8:
+            gname = ["add", "or", "adc", "sbb", "and", "sub", "xor", "cmp"][b >> 3]
+            if b & 1:
+                rname = "rax" if (self.bits == 64 and rex_w) else (
+                    "eax" if self.bits == 32 else "eax")
+                imm = cur.i64() if (self.bits == 64 and rex_w) else cur.i32()
+                mnem, ops = gname, [rname, f"0x{imm & 0xffffffffffffffff:x}"
+                                    if self.bits == 64 else f"0x{imm & 0xffffffff:x}"]
+            else:
+                mnem, ops = gname, ["al", f"0x{cur.u8():x}"]
         # ---- i386 0x40-0x4f are inc/dec; 0x63 is movsxd (64) / arpl (32) ----
-        if self.bits == 32 and 0x40 <= b <= 0x4f:
+        elif self.bits == 32 and 0x40 <= b <= 0x4f:
             mnem, ops = ("inc" if b < 0x48 else "dec"), [self.R[b & 7]]
         elif b == 0x63:
             mod, reg, rm = modrm()
@@ -451,6 +462,15 @@ class Disasm:
             mnem = "pushf" if b == 0x9c else "popf"
         elif b in (0x9e, 0x9f):
             mnem = "sahf" if b == 0x9e else "lahf"
+        elif b in (0x06, 0x07, 0x0e, 0x16, 0x17, 0x1e, 0x1f):
+            mnem = {0x06: "push", 0x07: "pop", 0x0e: "push",
+                    0x16: "push", 0x17: "pop", 0x1e: "push",
+                    0x1f: "pop"}[b]
+            ops = [{0x06: "es", 0x07: "es", 0x0e: "cs",
+                    0x16: "ss", 0x17: "ss", 0x1e: "ds",
+                    0x1f: "ds"}[b]]
+        elif b in (0x27, 0x2f, 0x37, 0x3f):
+            mnem = {0x27: "daa", 0x2f: "das", 0x37: "aaa", 0x3f: "aas"}[b]
         elif b in (0x60, 0x61):
             mnem = "pusha" if b == 0x60 else "popa"
         elif b in (0xa8, 0xa9):  # test al/eax, imm
@@ -570,7 +590,7 @@ class Disasm:
             try:
                 # count from the opcode byte, then add the prefix/REX bytes
                 total = self._unknown_len(cur, b, opcode_off) + (opcode_off - off)
-            except (IndexError, struct.error):
+            except Exception:
                 total = cur.pos - off or 1
             total = max(total, 1)
             mnem = ".byte " + code[off:off + total].hex()
@@ -584,7 +604,7 @@ class Disasm:
         while 0 <= off < size:
             try:
                 ins = self.decode_one(off)
-            except (IndexError, struct.error):
+            except Exception:
                 ins = Insn(self.base + off, 1, "bad", [], self.code[off:off + 1])
             if ins.size <= 0:
                 ins = Insn(self.base + off, 1, "bad", [], self.code[off:off + 1])
@@ -602,7 +622,7 @@ class Disasm:
                     break
                 try:
                     ins = self.decode_one(off)
-                except (IndexError, struct.error):
+                except Exception:
                     break
                 if ins.size <= 0:
                     break

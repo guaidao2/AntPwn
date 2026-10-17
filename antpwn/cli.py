@@ -61,10 +61,27 @@ def cmd_analyze(args):
     sc = Scanner(elf)
     findings = sc.scan()
     print(color.section(f"\n=== {i18n.t('scan')} ==="))
-    for f in findings[:20]:
+    shown, per_kind = [], {}
+    for f in findings:
+        if len(shown) >= 20:
+            break
+        if per_kind.get(f.kind, 0) >= 3:
+            per_kind[f.kind] += 1
+            continue
+        per_kind[f.kind] = per_kind.get(f.kind, 0) + 1
+        shown.append(f)
+    for f in shown:
         print(f"  [{color.kind(f.kind, f'{f.kind:>10}')}] {f.func} "
               f"@ {color.dim(f'{f.addr:#x}')} — {f.text}  "
               f"(score={color.score(f.score)})")
+    if len(findings) > len(shown):
+        hidden = len(findings) - len(shown)
+        if i18n.LANG == "zh":
+            print(color.dim(f"  ... 还有 {hidden} 处同类/低优先发现"
+                            "（完整列表用 --json 导出）"))
+        else:
+            print(color.dim(f"  ... {hidden} more duplicate/low-priority findings"
+                            " (use --json for the full list)"))
     if args.pseudo:
         print(color.section(f"\n=== {i18n.t('decompile')} ==="))
         dec = Decompiler(elf)

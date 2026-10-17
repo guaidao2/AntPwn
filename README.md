@@ -4,7 +4,7 @@
 
 > by guaidao2 · coolmoon
 
-**author: guaidao2** · version 1.7.1 · 中英双语 / bilingual
+**author: guaidao2** · version 1.7.2 · 中英双语 / bilingual
 
 > 原生静态分析 · 伪代码还原 · 漏洞扫描 · ptrace 动态调试 · 能力 DAG 规划 · 状态机驱动
 
@@ -33,11 +33,11 @@ exploit 脚本或 payload 文本，也不承诺"丢进去就出 flag"——它�
 |---|---|
 | 静态分析 | 原生 ELF32/ELF64 解析：PIE / NX / Canary / RELRO / ExecStack 保护识别，符号、PLT/GOT、重定位 |
 | 伪代码还原 | 自研反汇编器 → 类 P-code IR → CFG/支配/自然循环 → 数据流化简 → 结构化还原（if/else、while、do-while），输出带语法高亮的类 C 伪代码：`while (1) { menu(); if (fgets@plt(v0, 0x20, stdin) == 0) break; ... }` |
-| 漏洞扫描 | 规则引擎 + 模式识别：栈溢出 / 格式化字符串 / UAF / 后门函数 / 危险字符串，按危险度评分 |
+| 漏洞扫描 | 规则引擎 + 模式识别：栈溢出 / 格式化字符串 / UAF / 后门函数 / 堆越界（含 off-by-one） / 危险字符串，按危险度评分；以 main 可达性排序（用户代码优先），重复项折叠显示，大二进制首屏不再被同类发现淹没 |
 | 动态调试 | ctypes-ptrace 调试器：软件断点、单步、寄存器读写、内存读写、崩溃现场分析 |
 | 决策与规划 | 能力 DAG + 决策树 + 蚁群：能力分 session/process 域，失败蚂蚁留下的能力可复用，偏移用崩溃取证推断，信息素按二进制特征持久化 |
 | 状态机 | RECON → DECOMPILE → SCAN → STRATEGY → OFFSET → BUILD → TEST → VERIFY，每步都有中文说明 |
-| 自动验证 | 8 种用户态策略，基于行为特征而非函数名；跑通即拿到交互式 shell，用来验证判断而不是替你交差 |
+| 自动验证 | 多种用户态策略（核心 8 类 + 条件/实验策略），基于行为特征而非函数名；跑通即拿到交互式 shell，用来验证判断而不是替你交差 |
 | 失败诊断 | 策略不可行时说明原因：缺 gadget / 缺泄露通道 / PIE 与 Canary 卡在哪一步，并给出下一步方向 |
 | flag 捕获 | 拿到 shell 后自动执行 `id` / `pwd` / `ls` / `cat flag*` 等，命中 `flag{...}` 形态就直接打印 |
 | 远程直打 | `--remote HOST:PORT`：本地二进制负责分析，利用流量走 TCP，同一套 DAG/策略直接打远程服务 |
@@ -68,11 +68,13 @@ exploit 脚本或 payload 文本，也不承诺"丢进去就出 flag"——它�
 1. **ret2text** — 检测后门函数（行为：`system("/bin/sh")`，或可疑符号名）
 2. **ret2libc** — 泄露 `puts@GOT` → 算 libc 基址 → 返回溢出函数二次触发 → `system("/bin/sh")`
 3. **ret2syscall** — ROP 链设置寄存器 → `execve("/bin/sh",0,0)`
-4. **格式化字符串** — `%p` 喷射动态定位参数偏移；有后门则 `%hn` 覆写 GOT，**无后门则 `%s` 泄露 libc → printf@GOT→system**（通用路线）
-5. **shellcode** — ExecStack + `jmp rsp`
+4. **格式化字符串** — `%p` 喷射动态定位参数偏移（bits-aware）、自动判断交互轮次与输入后是否还有 printf 触发点；有后门用 `%hn` 改 GOT，无后门 `%s` 泄 libc 后改 printf→system，单轮且无触发点时给出明确诊断；32/64 位均支持，换行字节会破坏行输入时自动换可触发的 GOT 目标
+5. **shellcode** — ExecStack + `jmp rsp`/`call rsp` 等栈跳转 gadget；缺 gadget 时用程序打印的缓冲区地址（同进程校验、栈地址优先），64/32 位都支持
 6. **SROP** — 伪造 sigreturn 帧
 7. **栈迁移 (pivot)** — 小溢出 + `leave;ret` 劫持到 bss
 8. **堆利用 (heap)** — UAF 双读精确解 safe-linking chunk 地址 → tcache poisoning 落到程序指针数组 → 伪造槽位 → 泄露 libc → `free@GOT = system`
+9. **leaked-win / PIE** — 程序打印任意代码地址时按已知函数偏移反推 PIE 基址再 ret2win，不要求恰好打印 win；完全没有泄露时，尝试只覆盖返回地址低 1 字节或低 2 字节（枚举基址低 16 位的 16 种进位）做部分覆盖
+10. **通用堆菜单（heap_menu）** — 选项号优先从 `cmp/je` 分发链或 switch 跳转表（绝对 8 字节 / 相对 4 字节表项）映射到 handler，菜单分发函数不限于 main（会按输入调用优先扫描其它函数）；再按 handler 自身调用（malloc/free/write/read）分类 add/del/show/edit，标签乱写或 stripped 也能识别；泄露路径按能力选（打印地址 / show 原始字节 / 双释放 safe-linking 迭代解码；PIE 下若程序打印任意代码地址，会先反推基址再改 GOT），GOT 目标从 got_map 自动挑，不做题目专用硬编码
 
 ## 快速上手 / Quick Start
 
@@ -137,7 +139,8 @@ scan = Scanner(elf); scan.scan()     # 漏洞扫描 (bof/fmt/heap/backdoor)
 gf   = GadgetFinder(elf)
 rdi  = gf.first("pop rdi")           # 首个 pop rdi 地址, 找不到返回 None
 proc = Process("./vuln"); proc.start()
-proc.send(b"AAAA\n"); proc.cont()   # ptrace 调试: 寄存器/内存读写/断点
+proc.send(b"AAAA
+"); proc.cont()   # ptrace 调试: 寄存器/内存读写/断点
 regs = proc.getregs(); mem = proc.read_mem(regs.rsp, 0x40)
 
 fsm = FSM("./vuln")                  # 决策树 × 蚁群 × 能力 DAG
@@ -199,7 +202,7 @@ AntPwn/
 
 ## 已知边界 / Limitations
 
-- 静态分析与反编译支持 ELF64 / x86-64 与 ELF32 / i386；32 位利用已覆盖 ret2text、ret2syscall（int 0x80）、shellcode 与 ret2libc 的 cdecl 两阶段链；fmt / heap / SROP / pivot 仅 64 位实现（32 位暂不支持）
+- 静态分析与反编译支持 ELF64 / x86-64 与 ELF32 / i386；32 位利用已覆盖 ret2text、ret2syscall（int 0x80）、shellcode 与 ret2libc 的 cdecl 两阶段链；fmt 已支持 32/64 位（自动避开会破坏行输入的换行地址）；heap / SROP / pivot 仍仅 64 位实现
 - `antpwn_pheromone.json` 是学习产物（按二进制特征向量存边统计），删掉即重置经验
 - PIE + 无泄露通道、Full RELRO + 无 fmt/堆、Canary 无泄露等"无解或需高级技巧"场景会
   如实报告失败并给出诊断，不编造可行路径
@@ -212,6 +215,7 @@ AntPwn/
 - `ret2csu` 在“没有 pop rdi”的二进制上靠 one_gadget 收尾（需要本机装有 `one_gadget`）
 - gdb 插件不做 exploit 执行与多连接爆破，远程题仍建议用 CLI；静态链接 / musl 题会被识别成
   「没有 libc 映射」，`plan` 会明确提示这类边界
+- 总时限：环境变量 `ANTPWN_MAX_SECONDS`（默认 900 秒，设为 0 关闭）限制一次自动利用的总耗时；PIE 部分覆盖枚举、堆菜单多路径尝试会按此提前停止并给出诊断
 
 ---
 

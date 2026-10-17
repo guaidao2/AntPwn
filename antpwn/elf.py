@@ -392,7 +392,13 @@ class ELF:
 
     @property
     def canary(self):
-        return self.sym("__stack_chk_fail") is not None
+        """user code is canary-protected (static libc also defines the symbol,
+        but that does not mean this binary's own functions use a canary)"""
+        if self.sym("__stack_chk_fail") is None:
+            return False
+        if self.section(".dynamic") is None:
+            return False          # statically linked: symbol comes from libc
+        return True
 
     @property
     def relro(self):

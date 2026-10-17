@@ -2,7 +2,7 @@
 
 [中文](API.md) | [English](API.en.md)
 
-适用版本：AntPwn v1.7.1
+适用版本：AntPwn v1.7.2
 运行环境：Linux（x86-64 内核；可分析 32 位 i386 目标），Python 3.9+（开发和验证环境为 3.11 与 3.14）
 依赖：无第三方包，纯标准库
 
@@ -287,6 +287,8 @@ scanner.summary()                # Counter({kind: 数量})
 | `fmt` | 格式化字符串 | 9 |
 | `flag` | 疑似 flag 字符串 | 9 |
 | `heap` | UAF / double-free 线索 | 8 |
+| `heap_overflow` | malloc 后定长写越界 | 8 |
+| `offbyone` | 堆块 off-by-one | 6 |
 | `exec_stack` | 栈可执行 | 8 |
 | `no_canary` / `no_pie` | 保护缺失 | 5 / 4 |
 | `sh_string` | `/bin/sh` 等字符串 | 3 |
@@ -322,16 +324,22 @@ get = gf.rop_chain_builder()       # get("pop rdi") -> addr，缺失时抛 KeyEr
 `Gadget`：`addr`、`insns`（指令文本列表）、`effect`（描述）。
 
 这是**定向扫描**（在可执行段里搜固定字节模式），不是全量 gadget 数据库：
-只覆盖常见入口，够 AntPwn 自己的 8 种策略用。要全面的 gadget 列表请配合 ROPgadget。
+固定字节表之外，`find_all()` 还会对每个 `ret` 回溯 1-6 字节反汇编，语义化发现复合 pop
+（如 `pop rdi;pop rbp`）、`leave;ret`、`syscall;ret` 等；策略用 `ctx.pick_arg_gadget(reg)`
+取参数的 gadget，缺少标准单 pop 时自动用复合 gadget 并补 padding。
 
 ---
+
+扫描结果会按 main 可达性优先排序（用户代码在前），并暴露 `scanner.reachable` 供调用方过滤；
+CLI 首屏对同类发现做折叠显示，完整列表用 `--json` 导出。
 
 ## 7. `antpwn.procio` — 进程交互（不挂调试器）
 
 ```python
 from antpwn.procio import Tube
 
-t = Tube(path, argv=None, env=None)     # 子进程管道；stderr 合并到 stdout
+t = Tube(path, argv=None, env=None, pty=False)  # pty=True 用伪终端让 printf 行缓冲
+                                                # （程序会打印栈地址的题需要它）
 with Tube(path) as t:
     ...
 ```
@@ -613,11 +621,13 @@ FSM 与各策略共享的状态：
 | `Ret2Text` | 跳后门函数 |
 | `Ret2Libc` | 泄露 puts → 算基址 → 二次返回 system |
 | `Ret2Syscall` | ROP 链 execve |
-| `FmtGOT` | 格式化字符串（有后门 %hn / 无后门 %s 泄 libc） |
-| `Shellcode` | 可执行栈注入 |
+| `FmtGOT` | 格式化字符串（自动定位参数索引与交互轮次；有后门 %hn / 无后门 %s 泄 libc；单轮且无触发点明确诊断） |
+| `Shellcode` | 可执行栈注入（jmp/call-sp gadget 或同进程打印的缓冲区地址，64/32 位） |
 | `SROP` | sigreturn 帧 |
 | `StackPivot` | 栈迁移 |
-| `HeapUAF` | tcache poisoning |
+| `HeapUAF` | tcache poisoning（内置靶场流程）|
+| `MenuDriver` | 从字符串推断菜单选项/提示符，自适应应答（通用堆题交互）|
+| `HeapMenu` | 通用 UAF/tcache 菜单利用（PIE 下若程序在启动或首次 add 的输出里打印任意代码地址，可反推基址后继续改 GOT）：能力选泄露路径 + 自动 GOT 目标；投毒用指针大小的 chunk，GOT 写入不会误伤相邻表项；额外支持“从已分配 chunk 溢出改掉相邻空闲 chunk 的 tcache fd”（菜单型堆溢出，需程序打印 chunk 地址） |
 | `Ret2OneGadget` | 泄露 libc 后跳 one_gadget（普通 ret2libc 不适用时） |
 | `Ret2CsuOneGadget` | 没有 pop rdi：`__libc_csu_init` 泄露 + one_gadget |
 | `Ret2Dlresolve` | 伪造 Elf64 rela/sym/strtab，经 plt0 解析 system（无 libc 场景） |
@@ -822,7 +832,9 @@ best, score = colony.run()
 
 - **平台**：Linux（x86-64 内核，可 trace 32 位进程）；`debugger` 在 import 时就加载 `libc.so.6`，Windows/macOS
   上连 `import antpwn` 都会失败。
-- **32 位**：静态分析、反编译、ptrace 调试与 ret2text/ret2syscall/shellcode 利用已支持（`Process` 暴露 eip/esp/ebp）；fmt / heap / SROP / pivot 仅 64 位实现（32 位暂不支持）；ret2libc 的 i386 cdecl 链已端到端验证（Kali 自带 /lib32/libc）。
+- **32 位**：静态分析、反编译、ptrace 调试与 ret2text/ret2syscall/shellcode 利用已支持（`Process` 暴露 eip/esp/ebp）；fmt 已支持 32/64 位（多 GOT 触发目标自动选择、规避换行字节；无后门 %s→libc 路径的 32 位实现已用 i386_fmt_libc 验证，GOT 地址含换行而高低 16 位可直接复用时会退化为一侧 %hn 部分写）；heap / SROP / pivot 仅 64 位实现；ret2libc 的 i386 cdecl 链已端到端验证（Kali 自带 /lib32/libc，puts 或 write(1,got,4) 泄露均可）。
+
+- **总时限**：`ANTPWN_MAX_SECONDS`（默认 900，0 关闭）限制一次自动利用总耗时，超时会停止后续策略并给出诊断。
 - **全局状态**：`i18n.LANG` 是模块级变量，多线程/多任务并发时语言会互相影响。
 - **信息素文件**：默认写当前工作目录的 `antpwn_pheromone.json`；无锁，并发跑会互相覆盖；
   测试/CI 里建议显式传 `phero_path` 或跑前删除，保证结果可复现。

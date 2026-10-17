@@ -880,8 +880,12 @@ class Lifter:
             if collect:
                 stmts.append(call(fname, args))
                 self.ir.calls.append(fname)
-                if fname in ("system", "execve", "execve@plt", "system@plt") \
-                        and args and args[0][0] == "str":
+                base = fname.split("@")[0]
+                for pref in ("__libc_", "_IO_", "__GI_", "__isoc99_"):
+                    if base.startswith(pref):
+                        base = base[len(pref):]
+                        break
+                if base in ("system", "execve") and args and args[0][0] == "str":
                     self.ir.effects.append(("backdoor_shell", args[0][1]))
             for r in (CALLER_SAVED if self.bits == 64 else
                       {"eax", "ecx", "edx"}):

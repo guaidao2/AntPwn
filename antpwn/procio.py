@@ -9,17 +9,45 @@ import time
 
 
 class Tube:
-    def __init__(self, path, argv=None, env=None):
-        self.proc = subprocess.Popen(
-            [path] + (argv or []), stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            env=env or dict(os.environ), bufsize=0)
+    def __init__(self, path, argv=None, env=None, pty=False):
+        self.pty = bool(pty)
+        self._fd = None
+        if self.pty:
+            import pty as _pty
+            import tty as _tty
+            master, slave = _pty.openpty()
+            try:
+                _tty.setraw(slave)
+            except Exception:
+                pass
+            try:
+                self.proc = subprocess.Popen(
+                    [path] + (argv or []), stdin=slave, stdout=slave,
+                    stderr=slave, env=env or dict(os.environ),
+                    bufsize=0, close_fds=True)
+            except Exception:
+                os.close(master)
+                os.close(slave)
+                raise
+            os.close(slave)
+            self._fd = master
+        else:
+            self.proc = subprocess.Popen(
+                [path] + (argv or []), stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                env=env or dict(os.environ), bufsize=0)
+
+    def _out_fd(self):
+        return self._fd if self.pty else self.proc.stdout.fileno()
 
     def send(self, data):
         if isinstance(data, str):
             data = data.encode()
-        self.proc.stdin.write(data)
-        self.proc.stdin.flush()
+        if self.pty:
+            os.write(self._fd, data)
+        else:
+            self.proc.stdin.write(data)
+            self.proc.stdin.flush()
 
     def sendline(self, data=b""):
         if isinstance(data, str):
@@ -27,9 +55,13 @@ class Tube:
         self.send(data + b"\n")
 
     def recv(self, timeout=1.0, size=4096):
-        r, _, _ = select.select([self.proc.stdout], [], [], timeout)
+        fd = self._out_fd()
+        r, _, _ = select.select([fd], [], [], timeout)
         if r:
-            return os.read(self.proc.stdout.fileno(), size)
+            try:
+                return os.read(fd, size)
+            except OSError:
+                return b""
         return b""
 
     def recv_until(self, marker, timeout=3.0):
@@ -38,9 +70,13 @@ class Tube:
         buf = b""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            r, _, _ = select.select([self.proc.stdout], [], [], 0.1)
+            fd = self._out_fd()
+            r, _, _ = select.select([fd], [], [], 0.1)
             if r:
-                buf += os.read(self.proc.stdout.fileno(), 4096)
+                try:
+                    buf += os.read(fd, 4096)
+                except OSError:
+                    break
                 if marker in buf:
                     return buf
         return buf
@@ -76,6 +112,22 @@ class Tube:
             self.proc.kill()
         except Exception:
             pass
+        try:
+            self.proc.wait(timeout=0.5)   # reap the child, no zombies
+        except Exception:
+            pass
+        for f in (getattr(self.proc, "stdin", None), getattr(self.proc, "stdout", None)):
+            try:
+                if f:
+                    f.close()
+            except Exception:
+                pass
+        if self.pty and self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
 
     def __enter__(self):
         return self
