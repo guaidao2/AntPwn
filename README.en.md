@@ -4,7 +4,7 @@
 
 > by guaidao2 · coolmoon
 
-**author: guaidao2** · version 1.5.3 · bilingual (zh / en)
+**author: guaidao2** · version 1.6.0 · bilingual (zh / en)
 
 > Native static analysis · pseudo-code recovery · vulnerability scanning · ptrace debugging ·
 > capability-DAG planning · state-machine driven
@@ -52,6 +52,7 @@ containers and can be imported as a library into your own toolchain.
 | Dataflow scan | correlates `read`/`scanf` lengths with stack buffer sizes: exact overflow bytes, off-by-one detection, and no false positive for width-limited `scanf("%63s")` |
 | New strategies | `one_gadget`, `ret2csu` (with one_gadget), `ret2dlresolve`, byte-wise canary brute force (remote fork servers) |
 | Plugin API | `register_strategy()` / `register_technique()` add strategies and capability-DAG edges without touching the core |
+| gdb plugin | after `source antpwn-gdb.py` use `antpwn recon/vuln/disas/pseudo/xrefs/offset/trace/plan` inside gdb; same engine, zh/en switchable |
 | Structured / reproducible | `pwn --json` (full result incl. trace and pheromone), `--no-pheromone`, `--libc PATH`, `--retries N`; `view export` writes html/json |
 | Reporting / i18n | `--lang zh / en`; `--report out.html` writes the conclusions and decision record |
 | Terminal colour | ANSI styling on a TTY; `--color always / never` or `NO_COLOR` / `ANTPWN_COLOR` to override; pipes and logs degrade to plain text |
@@ -113,6 +114,15 @@ python3 antpwn.py pwn ./pwn --json out.json --no-pheromone
 
 # after pip install . the antpwn command is available
 pip install .
+
+# drive the analysis engine from gdb (just source the loader)
+gdb -q ./challenges/bin/baby_bof
+(gdb) source /root/AntPwn/antpwn-gdb.py
+(gdb) antpwn vuln
+(gdb) antpwn disas vuln
+(gdb) run
+(gdb) antpwn offset
+(gdb) antpwn plan
 ```
 
 All key parameters (overflow offset, format-string argument index, heap chunk addresses) are
@@ -187,6 +197,7 @@ AntPwn/
 │   ├── report.py      #   HTML report
 │   └── cli.py         #   command line entry
 ├── challenges/        # 8 original challenges (with source) + 3 advanced + 2 blind
+├── antpwn-gdb.py      # gdb plugin loader (source this file inside gdb)
 ├── pyproject.toml     # pip install + console script (antpwn after pip install .)
 ├── .github/workflows/ # test.yml (CI smoke + unit tests), release.yml (tag release)
 ├── docs/API.md        # full API reference (中文), API.en.md (English)

@@ -483,7 +483,7 @@ class Repl:
             if not code:
                 continue
             try:
-                for ins in Disasm(code, sym.value).linear(len(code)):
+                for ins in Disasm(code, sym.value).recursive(len(code), [0]):
                     if not ins.is_call:
                         continue
                     tgt = ins.target()

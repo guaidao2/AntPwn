@@ -309,6 +309,16 @@ class TestPackagingFiles(unittest.TestCase):
         self.assertTrue((root / ".github/workflows/test.yml").is_file())
         self.assertTrue((root / ".github/workflows/release.yml").is_file())
 
+    def test_gdb_plugin_assets(self):
+        root = pathlib.Path(__file__).resolve().parent.parent
+        loader = (root / "antpwn-gdb.py").read_text(encoding="utf-8")
+        plugin = (root / "antpwn/gdbplugin.py").read_text(encoding="utf-8")
+        self.assertIn("gdbplugin.register()", loader)
+        self.assertIn("gdb.Command", plugin)
+        for cmd in ("recon", "vuln", "disas", "pseudo", "xrefs", "offset",
+                    "trace", "plan", "lang"):
+            self.assertIn(f'"{cmd}"', plugin)
+
 
 if __name__ == "__main__":
     unittest.main()

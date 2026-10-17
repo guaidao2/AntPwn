@@ -2,7 +2,7 @@
 
 [中文](API.md) | **English**
 
-Version: AntPwn v1.5.3
+Version: AntPwn v1.6.0
 Platform: Linux / x86-64, Python 3.9+ (developed and verified on 3.11 and 3.14)
 Dependencies: none (standard library only)
 
@@ -33,6 +33,7 @@ into your scripts, platform or CTF toolchain.
 17. `antpwn.color` — terminal colour styling
 18. `antpwn.repl` — interactive browser (r2-style)
 19. Packaging, tests and CI
+20. `antpwn.gdbplugin` — the gdb plugin
 
 ---
 
@@ -919,3 +920,47 @@ History defaults to `~/.antpwn_history`; `ANTPWN_HISTORY=/path` overrides it and
 - CI: `.github/workflows/test.yml` runs version checks, `py_compile`, analyze/view/pwn smoke,
   unit tests and a wheel build; `.github/workflows/release.yml` handles tag-driven releases.
 - Plugin entry points: `from antpwn import register_strategy, register_technique`.
+
+---
+
+## 20. `antpwn.gdbplugin` — the gdb plugin
+
+Use the same analysis engine from inside gdb (no third-party packages; gdb's own
+Python interpreter is enough):
+
+```text
+(gdb) source /path/to/AntPwn/antpwn-gdb.py
+(gdb) antpwn help
+```
+
+or in `~/.gdbinit`:
+
+```python
+python import sys; sys.path.insert(0, "/path/to/AntPwn"); import antpwn.gdbplugin; antpwn.gdbplugin.register()
+```
+
+Commands:
+
+| command | purpose |
+|---|---|
+| `antpwn recon` / `info` | mitigations, entry, function/string counts |
+| `antpwn vuln [kind\|func]` | scan and highlight findings (same source as `view vuln`) |
+| `antpwn disas [func\|addr] [n]` | disassembly with `\|`/`!` rails on vulnerable lines and `=>` at `$pc` |
+| `antpwn pseudo [func\|addr]` | pseudo-code |
+| `antpwn xrefs [func]` | callers + callees (recursive scan, fewer false hits) |
+| `antpwn offset [gen [n]]` | decode the cyclic offset from the current crash; `gen` writes a pattern file |
+| `antpwn trace on\|off\|show` | breakpoints on dangerous PLT calls, logging args + backtrace, auto-continue |
+| `antpwn plan` | rank strategies from capabilities known in this session (offset, libc base) |
+| `antpwn lang zh\|en` | switch language |
+| other `view` commands | `ls` / `strings` / `find` / `gadget` / `export` / `x` ... work as-is |
+
+Design: read-only commands reuse `Repl`/`Scanner`, so gdb findings match the CLI;
+`offset` reads crash registers/memory through gdb instead of starting a second
+ptrace debugger (two debuggers cannot own the same process); `trace` subclasses
+`gdb.Breakpoint` and returns `False` from `stop()` to auto-continue; `plan` combines
+static feasibility of `all_strategies()` with session capabilities and never
+executes an exploit.
+
+Limits: remote targets are still better served by the CLI (`pwn --remote`); the
+plugin does not run exploits or large brute-force loops; gdb must be built with
+Python support (the norm on mainstream distributions).

@@ -72,6 +72,28 @@ jobs:
           set -eu
           python3 -m unittest discover -s tests -v
 
+      - name: GDB plugin smoke (optional, needs gdb)
+        run: |
+          set -eu
+          if ! command -v gdb >/dev/null 2>&1; then
+            echo "gdb not installed on this runner, skipping"
+            exit 0
+          fi
+          gdb -q -batch \
+            -ex "source antpwn-gdb.py" \
+            -ex "file challenges/bin/baby_bof" \
+            -ex "antpwn recon" \
+            -ex "antpwn vuln" \
+            -ex "antpwn disas vuln 32" \
+            -ex "antpwn pseudo vuln" \
+            -ex "antpwn xrefs vuln" \
+            -ex "antpwn offset gen 200" \
+            -ex "antpwn plan" \
+            2>&1 | tee /tmp/gdb.log
+          grep -q "PIE" /tmp/gdb.log
+          grep -q "bof" /tmp/gdb.log
+          grep -q "可行路线\|feasible routes" /tmp/gdb.log
+
       - name: Package build sanity
         run: |
           python3 -m pip install --quiet build

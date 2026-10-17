@@ -2,7 +2,7 @@
 
 [中文](API.md) | [English](API.en.md)
 
-适用版本：AntPwn v1.5.3
+适用版本：AntPwn v1.6.0
 运行环境：Linux / x86-64，Python 3.9+（开发和验证环境为 3.11 与 3.14）
 依赖：无第三方包，纯标准库
 
@@ -32,6 +32,7 @@ AntPwn 的 CLI 只是薄壳，所有能力都在 `antpwn` 包里。这份文档�
 17. `antpwn.color` — 终端配色
 18. `antpwn.repl` — 交互式浏览（r2 风格）
 19. 打包、测试与 CI
+20. `antpwn.gdbplugin` — gdb 插件
 
 ---
 
@@ -901,3 +902,43 @@ histedit.save()                         # 落历史
 - CI：`.github/workflows/test.yml` 做版本校验、`py_compile`、analyze/view/pwn 冒烟、
   unittest、wheel 构建；`.github/workflows/release.yml` 负责 tag 触发发版。
 - 插件入口：`from antpwn import register_strategy, register_technique`。
+
+---
+
+## 20. `antpwn.gdbplugin` — gdb 插件
+
+在 gdb 里复用同一套分析引擎（不需要装任何第三方包，gdb 自带 Python 即可）：
+
+```text
+(gdb) source /path/to/AntPwn/antpwn-gdb.py
+(gdb) antpwn help
+```
+
+或在 `~/.gdbinit` 里：
+
+```python
+python import sys; sys.path.insert(0, "/path/to/AntPwn"); import antpwn.gdbplugin; antpwn.gdbplugin.register()
+```
+
+命令：
+
+| 命令 | 作用 |
+|---|---|
+| `antpwn recon` / `info` | 保护、入口、函数/字符串数量 |
+| `antpwn vuln [kind\|func]` | 扫描漏洞并高亮（与 `view vuln` 同源） |
+| `antpwn disas [func\|addr] [n]` | 反汇编，漏洞行画 `\|`/`!`，当前 `$pc` 标 `=>` |
+| `antpwn pseudo [func\|addr]` | 伪代码 |
+| `antpwn xrefs [func]` | 调用关系（递归扫描构建，减少误报） |
+| `antpwn offset [gen [n]]` | 从当前崩溃现场反解 cyclic 偏移；`gen` 生成模式文件 |
+| `antpwn trace on\|off\|show` | 在危险 PLT 调用点下断点，记录参数与 backtrace，命中自动继续 |
+| `antpwn plan` | 结合会话内已知能力（offset、libc base）给出策略优先级 |
+| `antpwn lang zh\|en` | 中英文切换 |
+| 其余 `view` 命令 | `ls` / `strings` / `find` / `gadget` / `export` / `x` 等直接可用 |
+
+设计要点：只读命令直接复用 `Repl` 与 `Scanner`，所以 gdb 里的判断和 CLI 一致；
+`offset` 走 gdb 自己的寄存器/内存读取，不再启动第二个 ptrace 调试器（两者不能同时
+控制同一进程）；`trace` 用 `gdb.Breakpoint` 子类，`stop()` 里记录信息后返回 `False`
+自动继续；`plan` 复用 `all_strategies()` 的静态可行性 + 会话能力，不执行利用。
+
+限制：远程题仍建议用 CLI（`pwn --remote`）；gdb 侧不做 exploit 执行与多连接爆破；
+需要 gdb 编译时带 Python（主流发行版默认都有）。

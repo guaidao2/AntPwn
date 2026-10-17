@@ -4,7 +4,7 @@
 
 > by guaidao2 · coolmoon
 
-**author: guaidao2** · version 1.5.3 · 中英双语 / bilingual
+**author: guaidao2** · version 1.6.0 · 中英双语 / bilingual
 
 > 原生静态分析 · 伪代码还原 · 漏洞扫描 · ptrace 动态调试 · 能力 DAG 规划 · 状态机驱动
 
@@ -47,6 +47,7 @@ exploit 脚本或 payload 文本，也不承诺"丢进去就出 flag"——它�
 | 数据流扫描 | 把 `read`/`scanf` 的长度与栈缓冲大小做关联：算出确定溢出字节数、识别 off-by-one，`scanf("%63s")` 这类有宽度的不误报 |
 | 新利用策略 | `one_gadget`、`ret2csu`（配合 one_gadget）、`ret2dlresolve`、canary 逐字节爆破（远程 fork 服务） |
 | 插件扩展 | `register_strategy()` / `register_technique()`：外部注册策略与能力 DAG 边，不改核心代码 |
+| gdb 插件 | `source antpwn-gdb.py` 后在 gdb 里用 `antpwn recon/vuln/disas/pseudo/xrefs/offset/trace/plan`，复用同一套引擎，支持中英切换 |
 | 结构化与可复现 | `pwn --json` 输出完整结果（含 trace/信息素统计）；`--no-pheromone`、`--libc PATH`、`--retries N`；`view export` 导出 html/json |
 | 报告与双语 | `--lang zh / en`；`--report out.html` 输出分析结论与决策记录 |
 | 终端配色 | TTY 下自动启用 ANSI 配色；`--color always / never` 或 `NO_COLOR` / `ANTPWN_COLOR` 强制开关，管道与日志自动降级为纯文本 |
@@ -105,6 +106,15 @@ python3 antpwn.py pwn ./pwn --json out.json --no-pheromone
 
 # pip 安装后可以直接用 antpwn 命令
 pip install .
+
+# gdb 里直接调用分析引擎（source 一下即可）
+gdb -q ./challenges/bin/baby_bof
+(gdb) source /root/AntPwn/antpwn-gdb.py
+(gdb) antpwn vuln
+(gdb) antpwn disas vuln
+(gdb) run
+(gdb) antpwn offset
+(gdb) antpwn plan
 ```
 
 参数（溢出偏移、fmt 参数位置、堆 chunk 地址）全部动态探测，不依赖特定函数名或题目提示语；
@@ -173,6 +183,7 @@ AntPwn/
 │   ├── report.py      #   HTML 报告
 │   └── cli.py         #   命令行入口
 ├── challenges/        # 8 道原创靶场题（含源码）+ 3 道高级题 + 2 道盲测题
+├── antpwn-gdb.py      # gdb 插件加载器（gdb 里 source 这个文件）
 ├── pyproject.toml     # pip 安装与 console script（pip install . 后可用 antpwn）
 ├── .github/workflows/ # test.yml（CI 冒烟+单测）与 release.yml（tag 自动发版）
 ├── docs/API.md        # 完整 API 文档（模块 / 数据结构 / 扩展示例）
