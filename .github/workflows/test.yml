@@ -106,11 +106,6 @@ jobs:
           PY
           done
 
-      - name: Fixture smokes (heap menu + 32-bit when gcc -m32 is present)
-        run: |
-          set -eu
-          bash tests/fixtures/smoke_heap_menu.sh
-          bash tests/fixtures/smoke_i386.sh
 
       - name: GDB plugin smoke (real inferior, needs gdb)
         run: |

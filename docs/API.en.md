@@ -2,7 +2,7 @@
 
 [中文](API.md) | **English**
 
-Version: AntPwn v1.7.2
+Version: AntPwn v1.7.3
 Platform: Linux (x86-64 kernel; 32-bit i386 targets can be analysed), Python 3.9+ (developed and verified on 3.11 and 3.14)
 Dependencies: none (standard library only)
 
