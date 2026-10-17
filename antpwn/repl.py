@@ -55,6 +55,26 @@ class _Completer:
         return matches[state] if state < len(matches) else None
 
 
+# (name, zh, en) — shown by the gdb plugin's `antpwn help`; keep in sync with
+# Repl._commands below (primary names only, aliases omitted)
+COMMAND_DOCS = [
+    ("ls", "列出函数/符号", "list functions and symbols"),
+    ("calls", "函数级调用关系", "function-level call graph"),
+    ("strings", "可打印字符串", "printable strings"),
+    ("find", "搜函数名/字符串", "search symbols and strings"),
+    ("plt", "PLT/GOT 导入表", "PLT/GOT imports"),
+    ("sec", "节区信息", "sections"),
+    ("gadgets", "ROP gadget 汇总", "all ROP gadgets"),
+    ("gadget", "按模式搜 gadget", "search a gadget pattern"),
+    ("xrefs", "谁调用它/它调用谁", "callers + callees"),
+    ("export", "导出 json/html", "export json/html"),
+    ("x", "读内存/文件字节", "hexdump memory or file"),
+    ("disas", "反汇编", "disassemble"),
+    ("pseudo", "伪代码", "pseudo-code"),
+    ("vuln", "漏洞列表", "findings list"),
+]
+
+
 class Repl:
     def __init__(self, elf):
         self.elf = elf
@@ -208,15 +228,16 @@ class Repl:
         for cmd, desc, example in rows:
             print(f"  {color.style(cmd, 'bold'):<28} {desc}")
             print(f"  {color.dim('  e.g. ' + example)}")
-        print(color.dim("  tip: 漏洞行在 disas/pseudo 里自动标红，vuln 可先看全量报告"))
+        print(color.dim("  " + i18n.t("tip_help")))
         print()
 
     def cmd_info(self, _arg=""):
         elf = self.elf
         print(color.section("== info =="))
         print(f"  {'file':<10}{elf.path}")
+        arch = "i386" if elf.bits == 32 else "x86-64"
         print(f"  {'type':<10}{'PIE' if elf.is_pie else 'EXEC'}  "
-              f"{'ELF64' if elf.bits == 64 else 'ELF32'}  x86-64")
+              f"ELF{elf.bits}  {arch}  word={elf.bits // 8}")
         print(f"  {'entry':<10}{color.dim(f'{elf.e_entry:#x}')}")
         print(f"  {'PIE':<10}{color.value_yes(i18n.t('yes')) if elf.is_pie else color.value_no(i18n.t('no'))}")
         print(f"  {'NX':<10}{color.value_yes(i18n.t('yes')) if elf.has_nx else color.value_no(i18n.t('no'))}")
@@ -246,7 +267,7 @@ class Repl:
                   f"{color.style(s.name, 'bright_cyan'):<40}"
                   f" {color.dim(f'size={s.size:#x}') if s.size else ''}{note}")
         if len(funcs) > 200:
-            print(color.dim(f"  ... {len(funcs) - 200} more (ls <filter> to narrow)"))
+            print(color.dim(i18n.t("tip_ls_more").format(n=len(funcs) - 200)))
         print()
 
     def cmd_vuln(self, arg=""):
@@ -266,7 +287,7 @@ class Repl:
             print(f"  {color.style(f'[{f.kind:>10}]', *style)} "
                   f"{color.dim(f'{addr:<12}')} {color.style(f'{func:<22}', 'bright_cyan')} "
                   f"{f.text}  {color.dim(f'score={f.score}')}")
-        print(color.dim("  disas <func> / pseudo <func> 会自动标出这些位置"))
+        print(color.dim("  " + i18n.t("tip_vuln_mark")))
         print()
 
     def cmd_disas(self, arg=""):
@@ -300,7 +321,7 @@ class Repl:
             kinds = ", ".join(sorted({h.kind for h in hits}))
             print(color.style(f"// [VULN] {kinds} (top score {top.score})",
                               *_severity_style(top.score)))
-        for ins in Disasm(code, addr).linear(len(code)):
+        for ins in Disasm(code, addr, self.elf.bits).linear(len(code)):
             ops = ", ".join(ins.ops)
             hit = self._vuln_hit(ins.addr)
             body = (f"{color.dim(f'{ins.addr:#010x}')}  "
@@ -350,9 +371,10 @@ class Repl:
             print(color.style(f"// [VULN] {kinds} (top score {top.score})",
                               *_severity_style(top.score)))
         for line in self.dec.render(pf).splitlines():
-            if line.strip().startswith("// "):
+            stripped = line.strip()
+            if stripped.startswith("// "):
                 print(color.dim(line))
-            elif "(" in line and "{" in line:
+            elif "(" in line and "{" in line and not stripped.startswith(("if ", "while ")):
                 print(color.style(line, "bold", "bright_cyan"))
             else:
                 callee = line.split("(")[0].strip().split()[-1] if "(" in line and line.split("(")[0].strip() else ""
@@ -360,7 +382,7 @@ class Repl:
                 if base in DANGER:
                     print(color.style(line, *_severity_style(DANGER[base][1])))
                 else:
-                    print(line)
+                    print(color.highlight_c(line))
         print()
 
     def cmd_calls(self, arg=""):
@@ -483,7 +505,7 @@ class Repl:
             if not code:
                 continue
             try:
-                for ins in Disasm(code, sym.value).recursive(len(code), [0]):
+                for ins in Disasm(code, sym.value, self.elf.bits).recursive(len(code), [0]):
                     if not ins.is_call:
                         continue
                     tgt = ins.target()
@@ -522,13 +544,17 @@ class Repl:
         print()
 
     def cmd_gadget(self, arg=""):
-        from .gadgets import WANT
+        from .gadgets import WANT, WANT32
+        want = WANT32 if getattr(self.elf, "bits", 64) == 32 else WANT
         if not arg.strip():
-            print(color.section("== gadget names =="))
-            for name in sorted(WANT):
+            arch = "i386" if getattr(self.elf, "bits", 64) == 32 else "x86-64"
+            print(color.section(f"== gadget names ({arch}) =="))
+            for name in sorted(want):
                 n = len(self.gadgets.find_all().get(name, []))
                 print(f"  {color.style(name, 'yellow'):<24} {color.dim(f'{n} found')}")
-            print(color.dim('  usage: gadget "pop rdi; ret"  (free-form pattern)'))
+            sample = "pop ebx; ret" if getattr(self.elf, "bits", 64) == 32 \
+                else "pop rdi; ret"
+            print(color.dim(f'  usage: gadget "{sample}"  (free-form pattern)'))
             print()
             return
         pattern = arg.strip()
@@ -546,7 +572,7 @@ class Repl:
         found = []
         for va, code in self.elf.exec_segments():
             try:
-                insns = Disasm(code, va).linear(len(code))
+                insns = Disasm(code, va, self.elf.bits).linear(len(code))
             except Exception:
                 continue
             for i in range(len(insns) - len(tokens) + 1):
@@ -568,7 +594,7 @@ class Repl:
             code = self.elf.read(addr, 24)
             text = ""
             if code:
-                ins = Disasm(code, addr).decode_one(0)
+                ins = Disasm(code, addr, self.elf.bits).decode_one(0)
                 if ins is not None:
                     text = f"{ins.mnem} {', '.join(ins.ops)}"
             print(f"  {color.dim(f'{addr:#010x}')}  {color.info(text)}")

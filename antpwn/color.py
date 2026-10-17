@@ -58,18 +58,29 @@ def enabled():
     if _enabled is not None:
         return _enabled
 
+    # NO_COLOR / CLICOLOR=0 are user intent: honour them even if ANTPWN_COLOR
+    # was set by a wrapper; "ANTPWN_COLOR=always" is the only explicit override.
+    if os.environ.get("NO_COLOR") or os.environ.get("CLICOLOR") == "0":
+        force = os.environ.get("ANTPWN_COLOR", "").strip().lower()
+        if force != "always":
+            _enabled = False
+            return _enabled
     force = os.environ.get("ANTPWN_COLOR")
     if force is not None:
         _enabled = force.strip().lower() not in ("", "0", "false", "no", "off")
-        return _enabled
-    if os.environ.get("NO_COLOR") or os.environ.get("CLICOLOR") == "0":
-        _enabled = False
         return _enabled
 
     try:
         is_tty = sys.stdout is not None and sys.stdout.isatty()
     except Exception:
         is_tty = False
+    if not is_tty:
+        # gdb (and some embedders) replace sys.stdout with a non-tty stream
+        # even though fd 1 is the real terminal; fall back to the descriptor.
+        try:
+            is_tty = os.isatty(1)
+        except Exception:
+            is_tty = False
     if not is_tty:
         _enabled = False
         return _enabled
@@ -203,3 +214,34 @@ def state(name, text=None):
 
 def event(ok_flag, text):
     return style(text, "green" if ok_flag else "red")
+
+
+_CODE_TOKEN = __import__("re").compile(
+    r'(//[^\n]*)|("(?:[^"\\]|\\.)*")|\b(0x[0-9a-fA-F]+|\d+)\b|'
+    r'\b(void|char|int|unsigned|signed|uint8_t|uint16_t|uint32_t|uint64_t|'
+    r'int8_t|int16_t|int32_t|int64_t|size_t|ssize_t|long|short|float|double)\b|'
+    r'\b(if|else|while|for|do|return|break|continue|goto|switch|case|default)\b|'
+    r'([A-Za-z_]\w*)\s*(?=\()')
+
+
+def highlight_c(text):
+    """rz-ghidra style syntax colouring for pseudo-code (ANSI when enabled)."""
+    if not enabled():
+        return text
+
+    def repl(m):
+        if m.group(1):
+            return style(m.group(1), "dim")
+        if m.group(2):
+            return style(m.group(2), "green")
+        if m.group(3):
+            return style(m.group(3), "magenta")
+        if m.group(4):
+            return style(m.group(4), "cyan")
+        if m.group(5):
+            return style(m.group(5), "bold", "yellow")
+        if m.group(6):
+            return style(m.group(6), "bright_cyan")
+        return m.group(0)
+
+    return _CODE_TOKEN.sub(repl, text)

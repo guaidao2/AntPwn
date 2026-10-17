@@ -28,15 +28,15 @@ def _mitigation(on):
 
 
 def _print_pseudo(text):
-    """Pseudo-code with dimmed comments and a highlighted function header."""
+    """Pseudo-code with dimmed comments and syntax highlighting (rz-ghidra style)."""
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("// "):
             print(color.dim(line))
-        elif "(" in line and "{" in line:
+        elif "(" in line and "{" in line and not stripped.startswith(("if ", "while ")):
             print(color.style(line, "bold", "bright_cyan"))
         else:
-            print(line)
+            print(color.highlight_c(line))
 
 
 def cmd_analyze(args):
@@ -48,6 +48,8 @@ def cmd_analyze(args):
     from .decompiler import Decompiler
     elf = ELF(args.binary)
     print(color.section(f"\n=== {i18n.t('recon')} ==="))
+    arch = "i386" if elf.bits == 32 else "x86-64"
+    print(f"  Arch:     ELF{elf.bits} ({arch})")
     print(f"  PIE:      {_mitigation(elf.is_pie)}")
     print(f"  NX:       {_mitigation(elf.has_nx)}")
     print(f"  Canary:   {_mitigation(elf.canary)}")

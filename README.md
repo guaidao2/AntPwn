@@ -4,12 +4,12 @@
 
 > by guaidao2 · coolmoon
 
-**author: guaidao2** · version 1.6.1 · 中英双语 / bilingual
+**author: guaidao2** · version 1.7.0 · 中英双语 / bilingual
 
 > 原生静态分析 · 伪代码还原 · 漏洞扫描 · ptrace 动态调试 · 能力 DAG 规划 · 状态机驱动
 
 **零第三方依赖**：不依赖 pwntools / gdb / capstone / ropper / angr，全部用纯 Python
-原生实现（自带 ELF64 解析器、x86-64 反汇编器、ptrace 调试器、libc 偏移提取）。
+原生实现（自带 ELF32/ELF64 解析器、x86-32/64 反汇编器、ptrace 调试器、libc 偏移提取）。
 
 ---
 
@@ -31,8 +31,8 @@ exploit 脚本或 payload 文本，也不承诺"丢进去就出 flag"——它�
 
 | 模块 | 说明 |
 |---|---|
-| 静态分析 | 原生 ELF64 解析：PIE / NX / Canary / RELRO / ExecStack 保护识别，符号、PLT/GOT、重定位 |
-| 伪代码还原 | 自研反汇编器 + 参数折叠，输出类 C 伪代码：`read(0, v0, 0x200)`、`system("/bin/sh")` |
+| 静态分析 | 原生 ELF32/ELF64 解析：PIE / NX / Canary / RELRO / ExecStack 保护识别，符号、PLT/GOT、重定位 |
+| 伪代码还原 | 自研反汇编器 → 类 P-code IR → CFG/支配/自然循环 → 数据流化简 → 结构化还原（if/else、while、do-while），输出带语法高亮的类 C 伪代码：`while (1) { menu(); if (fgets@plt(v0, 0x20, stdin) == 0) break; ... }` |
 | 漏洞扫描 | 规则引擎 + 模式识别：栈溢出 / 格式化字符串 / UAF / 后门函数 / 危险字符串，按危险度评分 |
 | 动态调试 | ctypes-ptrace 调试器：软件断点、单步、寄存器读写、内存读写、崩溃现场分析 |
 | 决策与规划 | 能力 DAG + 决策树 + 蚁群：能力分 session/process 域，失败蚂蚁留下的能力可复用，偏移用崩溃取证推断，信息素按二进制特征持久化 |
@@ -47,7 +47,7 @@ exploit 脚本或 payload 文本，也不承诺"丢进去就出 flag"——它�
 | 数据流扫描 | 把 `read`/`scanf` 的长度与栈缓冲大小做关联：算出确定溢出字节数、识别 off-by-one，`scanf("%63s")` 这类有宽度的不误报 |
 | 新利用策略 | `one_gadget`、`ret2csu`（配合 one_gadget）、`ret2dlresolve`、canary 逐字节爆破（远程 fork 服务） |
 | 插件扩展 | `register_strategy()` / `register_technique()`：外部注册策略与能力 DAG 边，不改核心代码 |
-| gdb 插件 | `source antpwn-gdb.py` 后在 gdb 里用 `antpwn recon/vuln/disas/pseudo/xrefs/offset/trace/plan`，复用同一套引擎，支持中英切换 |
+| gdb 插件 | `source antpwn-gdb.py`（或 pip 装后跑 `antpwn-gdb` 拿 .gdbinit 片段）。命令：`where`/`recon`/`vuln`（`--bp` 自动下断）/`disas`（无参围绕 `$pc`）/`pseudo`/`x $rsp`/`leak`/`maps`/`offset [gen\|0x..]`/`trace on [函数...] [--stop --max=N --dump]`/`plan`（给可粘贴下一步）/`report`/`export`/`reset`；专属提示符、Tab 补全、中英切换，和 gef/pwda 共存不抢提示符 |
 | 结构化与可复现 | `pwn --json` 输出完整结果（含 trace/信息素统计）；`--no-pheromone`、`--libc PATH`、`--retries N`；`view export` 导出 html/json |
 | 报告与双语 | `--lang zh / en`；`--report out.html` 输出分析结论与决策记录 |
 | 终端配色 | TTY 下自动启用 ANSI 配色；`--color always / never` 或 `NO_COLOR` / `ANTPWN_COLOR` 强制开关，管道与日志自动降级为纯文本 |
@@ -110,11 +110,14 @@ pip install .
 # gdb 里直接调用分析引擎（source 一下即可）
 gdb -q ./challenges/bin/baby_bof
 (gdb) source /root/AntPwn/antpwn-gdb.py
-(gdb) antpwn vuln
-(gdb) antpwn disas vuln
-(gdb) run
-(gdb) antpwn offset
-(gdb) antpwn plan
+(gdb) antpwn where            # 我在哪：$pc 前后指令 / $rsp 内容 / 寄存器 / backtrace
+(gdb) antpwn vuln --bp        # 漏洞列表 + 可直接下的断点
+(gdb) antpwn disas            # 无参就围绕当前 $pc
+(gdb) antpwn trace on gets --stop --dump   # 危险调用动态观测（命中即停）
+(gdb) run < antpwn_pattern.bin             # 先用 antpwn offset gen 生成
+(gdb) antpwn offset           # 反解偏移，自动写 $antpwn_offset 和信息素
+(gdb) antpwn plan             # 策略 + 下一条敲什么
+(gdb) antpwn report           # 导出本次会话 HTML 报告
 ```
 
 参数（溢出偏移、fmt 参数位置、堆 chunk 地址）全部动态探测，不依赖特定函数名或题目提示语；
@@ -165,9 +168,10 @@ python3 tests/run_all.py      # 11/11 全部拿下（8 靶场 + 2 盲测 + 1 优
 ```
 AntPwn/
 ├── antpwn/            # 核心工具包（纯 Python, 零依赖）
-│   ├── elf.py         #   ELF64 解析
-│   ├── disasm.py      #   x86-64 反汇编器（与 objdump 对拍一致）
-│   ├── decompiler.py  #   伪代码还原
+│   ├── elf.py         #   ELF32/ELF64 解析
+│   ├── disasm.py      #   x86-32/64 反汇编器（与 objdump 对拍一致）
+│   ├── ir.py          #   P-code 风格 IR / CFG / 支配 / 自然循环 / 栈变量
+│   ├── decompiler.py  #   结构化反编译（IR → if/else/while → 彩色伪代码）
 │   ├── scanner.py     #   漏洞扫描规则引擎
 │   ├── gadgets.py     #   ROP gadget 搜索
 │   ├── debugger.py    #   ptrace 动态调试器
@@ -184,17 +188,18 @@ AntPwn/
 │   └── cli.py         #   命令行入口
 ├── challenges/        # 8 道原创靶场题（含源码）+ 3 道高级题 + 2 道盲测题
 ├── antpwn-gdb.py      # gdb 插件加载器（gdb 里 source 这个文件）
+├── antpwn/gdb_loader.py # `antpwn-gdb` 命令：打印/写入 .gdbinit 片段
 ├── pyproject.toml     # pip 安装与 console script（pip install . 后可用 antpwn）
 ├── .github/workflows/ # test.yml（CI 冒烟+单测）与 release.yml（tag 自动发版）
 ├── docs/API.md        # 完整 API 文档（模块 / 数据结构 / 扩展示例）
 ├── docs/API.en.md     # 同上英文版 / English version of the API reference
 ├── README.en.md       # 英文版 README / English README
-└── tests/             # test_core.py 单测（stdlib unittest）+ run_all.py 全量回归
+└── tests/             # test_core.py 单测 + gdb_smoke.sh（真跑 gdb inferior）+ run_all.py 全量回归
 ```
 
 ## 已知边界 / Limitations
 
-- 仅支持 ELF64 / x86-64（开发环境无 32 位库）；32 位与静态链接场景暂未覆盖
+- 静态分析与反编译支持 ELF64 / x86-64 与 ELF32 / i386；32 位利用已覆盖 ret2text、ret2syscall（int 0x80）、shellcode 与 ret2libc 的 cdecl 两阶段链；fmt / heap / SROP / pivot 仅 64 位实现（32 位暂不支持）
 - `antpwn_pheromone.json` 是学习产物（按二进制特征向量存边统计），删掉即重置经验
 - PIE + 无泄露通道、Full RELRO + 无 fmt/堆、Canary 无泄露等"无解或需高级技巧"场景会
   如实报告失败并给出诊断，不编造可行路径
@@ -205,6 +210,8 @@ AntPwn/
 - off-by-one / off-by-null 默认只做**检测与打分**；附带一个实验性栈重叠利用
   （`ANTPWN_OFFBYNULL=1` 开启，成功与否取决于栈地址低字节能否落进缓冲区，不保证通用）
 - `ret2csu` 在“没有 pop rdi”的二进制上靠 one_gadget 收尾（需要本机装有 `one_gadget`）
+- gdb 插件不做 exploit 执行与多连接爆破，远程题仍建议用 CLI；静态链接 / musl 题会被识别成
+  「没有 libc 映射」，`plan` 会明确提示这类边界
 
 ---
 

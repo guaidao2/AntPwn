@@ -3,7 +3,7 @@ native static analysis · pseudo-code recovery · vuln scanning ·
 ptrace dynamic debugging · ant-colony optimization · FSM-driven exploiting
 bilingual (中文/English) · beginner friendly · authors: guaidao2 · coolmoon
 """
-__version__ = "1.6.1"
+__version__ = "1.7.0"
 __author__ = "guaidao2 · coolmoon"
 
 from .elf import ELF

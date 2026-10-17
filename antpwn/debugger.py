@@ -28,6 +28,10 @@ class Regs(ctypes.Structure):
     _fields_ = [(n, ctypes.c_ulonglong) for n in REG_NAMES]
 
 
+class ProcessError(RuntimeError):
+    pass
+
+
 class Breakpoint:
     def __init__(self, addr, orig):
         self.addr, self.orig, self.enabled = addr, orig, True
@@ -36,6 +40,13 @@ class Breakpoint:
 class Process:
     def __init__(self, path, argv=None, envp=None):
         self.path = path
+        try:
+            with open(path, "rb") as fp:
+                head = fp.read(5)
+            self.bits = 64 if head[4] == 2 else 32
+        except (OSError, IndexError):
+            self.bits = 64
+        self.arch = "x86_64" if self.bits == 64 else "i386"
         self.argv = [path] + (argv or [])
         self.envp = envp or [f"PATH={os.environ.get('PATH','')}", "HOME=/home/z"]
         self.pid = None
@@ -43,6 +54,22 @@ class Process:
         self.base = 0
         self.stdin_w = None
         self._stdin_pipe = os.pipe()
+
+    def _ptrace(self, req, addr=None, data=None):
+        ctypes.set_errno(0)
+        rc = libc.ptrace(req, self.pid, addr, data)
+        if rc == -1:
+            err = ctypes.get_errno()
+            hint = ""
+            if req in (PTRACE_GETREGS, PTRACE_SETREGS):
+                hint = (" (ptrace disabled by the container, or the kernel "
+                        "lacks IA32 compat support)" if self.bits == 32 else
+                        " (ptrace disabled by the container?)")
+            raise ProcessError(f"ptrace({req}) failed: {os.strerror(err)}{hint}")
+        return rc
+
+    def _word(self):
+        return 4 if self.bits == 32 else 8
 
     # ---------------- lifecycle ----------------
     def start(self, entry_bp=False, quiet=True):
@@ -66,7 +93,7 @@ class Process:
         self.stdin_w = w
         self.pid = pid
         os.waitpid(pid, 0)  # exec trap
-        libc.ptrace(PTRACE_SETOPTIONS, pid, None, PTRACE_O_EXITKILL)
+        self._ptrace(PTRACE_SETOPTIONS, None, PTRACE_O_EXITKILL)
         return self
 
     def send(self, data):
@@ -82,11 +109,11 @@ class Process:
             pass
 
     def cont(self, timeout=None):
-        libc.ptrace(PTRACE_CONT, self.pid, None, None)
+        self._ptrace(PTRACE_CONT)
         return self._wait(timeout)
 
     def step(self):
-        libc.ptrace(PTRACE_SINGLESTEP, self.pid, None, None)
+        self._ptrace(PTRACE_SINGLESTEP)
         return self._wait(2.0)
 
     def _wait(self, timeout=None):
@@ -119,11 +146,35 @@ class Process:
     # ---------------- regs/mem ----------------
     def getregs(self):
         r = Regs()
-        libc.ptrace(PTRACE_GETREGS, self.pid, None, ctypes.byref(r))
+        self._ptrace(PTRACE_GETREGS, None, ctypes.byref(r))
+        if self.bits == 32:
+            # on a 64-bit kernel the compat task still fills the 64-bit
+            # user_regs_struct; expose i386-style names for the callers
+            mask = 0xFFFFFFFF
+            r.rip &= mask
+            r.rsp &= mask
+            r.rbp &= mask
+            for a in ("rax", "rcx", "rdx", "rbx", "rsi", "rdi"):
+                setattr(r, a, getattr(r, a) & mask)
+            r.eip, r.esp, r.ebp = r.rip, r.rsp, r.rbp
+            r.eax, r.ecx, r.edx, r.ebx = r.rax, r.rcx, r.rdx, r.rbx
+            r.esi, r.edi = r.rsi, r.rdi
         return r
 
     def setregs(self, r):
-        libc.ptrace(PTRACE_SETREGS, self.pid, None, ctypes.byref(r))
+        if self.bits == 32:
+            # a caller may set `rip` directly (e.g. breakpoint restore); trust it
+            try:
+                if r.rip != r.eip:
+                    r.eip = r.rip
+            except AttributeError:
+                pass
+            for src, dst in (("eip", "rip"), ("esp", "rsp"), ("ebp", "rbp"),
+                             ("eax", "rax"), ("ebx", "rbx"), ("ecx", "rcx"),
+                             ("edx", "rdx"), ("esi", "rsi"), ("edi", "rdi")):
+                if hasattr(r, src):
+                    setattr(r, dst, getattr(r, src) & 0xFFFFFFFF)
+        self._ptrace(PTRACE_SETREGS, None, ctypes.byref(r))
 
     def peek(self, addr):
         ctypes.set_errno(0)
@@ -137,21 +188,31 @@ class Process:
                            ctypes.c_void_p(addr), ctypes.c_void_p(val))
 
     def read_mem(self, addr, size):
-        out = b""
-        for i in range(0, size, 8):
-            chunk = self.peek(addr + i)
-            out += struct.pack("<Q", chunk)
-        return out[:size]
+        # PEEKTEXT always returns a host word (8 bytes on x86-64). Align the
+        # read so it never straddles a page boundary, then slice what we need.
+        out = bytearray()
+        cur, remaining = addr, size
+        while remaining > 0:
+            base = cur & ~7
+            word = self.peek(base).to_bytes(8, "little")
+            off = cur - base
+            take = min(8 - off, remaining)
+            out += word[off:off + take]
+            cur += take
+            remaining -= take
+        return bytes(out)
 
     def write_mem(self, addr, data):
-        for i in range(0, len(data), 8):
-            chunk = data[i:i + 8]
-            if len(chunk) < 8:
-                old = self.peek(addr + i)
-                chunk = struct.pack("<Q", old)[:len(chunk)] + chunk
-                chunk = chunk.ljust(8, b"\x00")
-                chunk = data[i:i + 8].ljust(8, b"\x00")
-            self.poke(addr + i, struct.unpack("<Q", chunk)[0])
+        cur, i = addr, 0
+        while i < len(data):
+            base = cur & ~7
+            off = cur - base
+            word = bytearray(self.peek(base).to_bytes(8, "little"))
+            take = min(8 - off, len(data) - i)
+            word[off:off + take] = data[i:i + take]
+            self.poke(base, int.from_bytes(word, "little"))
+            cur += take
+            i += take
 
     # ---------------- breakpoints ----------------
     def bp(self, addr):
@@ -167,8 +228,10 @@ class Process:
             b = self.bps[addr]
             self.poke(addr, b.orig)                      # restore
             regs.rip = addr
+            if self.bits == 32:
+                regs.eip = addr
             self.setregs(regs)
-            libc.ptrace(PTRACE_SINGLESTEP, self.pid, None, None)
+            self._ptrace(PTRACE_SINGLESTEP)
             os.waitpid(self.pid, 0)
             self.poke(addr, (self.peek(addr) & ~0xFF) | 0xCC)  # re-arm
             return True

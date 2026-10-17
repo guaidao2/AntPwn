@@ -2,8 +2,8 @@
 
 [中文](API.md) | [English](API.en.md)
 
-适用版本：AntPwn v1.6.1
-运行环境：Linux / x86-64，Python 3.9+（开发和验证环境为 3.11 与 3.14）
+适用版本：AntPwn v1.7.0
+运行环境：Linux（x86-64 内核；可分析 32 位 i386 目标），Python 3.9+（开发和验证环境为 3.11 与 3.14）
 依赖：无第三方包，纯标准库
 
 AntPwn 的 CLI 只是薄壳，所有能力都在 `antpwn` 包里。这份文档按模块列出公开接口、
@@ -14,7 +14,7 @@ AntPwn 的 CLI 只是薄壳，所有能力都在 `antpwn` 包里。这份文档�
 ## 目录
 
 1. 快速开始
-2. `antpwn.elf` — ELF64 解析与保护识别
+2. `antpwn.elf` — ELF32/ELF64 解析与保护识别
 3. `antpwn.disasm` — 反汇编器
 4. `antpwn.decompiler` — 伪代码还原
 5. `antpwn.scanner` — 漏洞扫描
@@ -92,14 +92,14 @@ print("saved RIP offset:", off)
 
 ---
 
-## 2. `antpwn.elf` — ELF64 解析与保护识别
+## 2. `antpwn.elf` — ELF32/ELF64 解析与保护识别
 
 ```python
 from antpwn.elf import ELF, ELFError
 elf = ELF(path)                   # 读入整个文件；非 ELF 抛 ELFError
 ```
 
-只支持 ELF64；32 位二进制会抛 `ELFError("only ELF64 supported in this build")`。
+支持 ELF64（EM_X86_64）与 ELF32（EM_386）；`elf.bits` 为 32 或 64，其余成员在两种位宽下语义一致。
 
 ### 属性
 
@@ -110,7 +110,7 @@ elf = ELF(path)                   # 读入整个文件；非 ELF 抛 ELFError
 | `bits` | int | 固定 64 |
 | `endian` | str | `<` 或 `>` |
 | `e_type` | int | 2=EXEC，3=DYN(PIE) |
-| `e_machine` | int | 62 = x86-64 |
+| `e_machine` | int | 62 = x86-64, 3 = i386 |
 | `e_entry` | int | 入口虚拟地址 |
 | `phdrs` | list[Phdr] | 程序头 |
 | `sections` | list[Section] | 节 |
@@ -192,20 +192,32 @@ one = dis.decode_one(offset)                   # 单条，失败返回 None
 | `is_ret` / `is_call` / `is_jmp` / `is_jcc` | 指令类别判定（property） |
 | `target()` | 直接跳转/调用目标地址；非直接分支返回 None |
 
-覆盖常见 x86-64 指令（含 mov/lea/算术/逻辑/移位/串操作/分支/call/ret/syscall 等），
+覆盖常见 x86-64 与 i386 指令（含 mov/lea/算术/逻辑/移位/串操作/分支/call/ret/syscall/int 0x80 等；32 位模式 `Disasm(code, va, bits=32)`，无 REX、32 位寻址），
 与 objdump 做过对拍；**不覆盖**全部扩展指令（AVX、部分 SSE、非典型前缀组合）。
 遇到无法解码的字节会跳过，`recursive()` 按分支目标继续。
 
 ---
 
-## 4. `antpwn.decompiler` — 伪代码还原
+## 4. `antpwn.decompiler` — 伪代码还原（P-code IR 管线）
+
+反编译管线（纯 Python，参考 Ghidra/rz-ghidra 的 P-code 思路自己实现）：
+
+```
+反汇编 → IR 提升（表达式树/临时变量/比较分支）
+      → 基本块 + CFG（前驱后继、支配、后支配、自然循环）
+      → 符号执行式数据流 + 常量/复制传播 + 代数化简
+      → 栈变量恢复（char 数组大小、canary 槽隐藏、-O2 的 rsp 相对帧）
+      → 控制流结构化（if/else、while、do-while、early-return，不可约回退 goto）
+      → 类 C 渲染（纯文本用于 scanner；TTY 下带 rz-ghidra 风格语法高亮）
+```
 
 ```python
 from antpwn.decompiler import Decompiler
 
 dc = Decompiler(elf)                  # strings 参数可传入自定义 {vaddr: str}
 pf = dc.function(elf.sym("vuln"))     # -> PseudoFunc 或 None
-print(dc.render(pf))                  # 渲染成带缩进的类 C 文本
+print(dc.render(pf))                  # 纯文本（scanner 也解析这个格式）
+print(dc.render_ansi(pf))             # 语法高亮（TTY 下）
 ```
 
 `PseudoFunc`：
@@ -213,13 +225,33 @@ print(dc.render(pf))                  # 渲染成带缩进的类 C 文本
 | 成员 | 说明 |
 |---|---|
 | `name` / `addr` / `size` | 函数名、地址、大小 |
-| `lines` | `[(indent, text), ...]` 伪代码行 |
+| `lines` | `[(indent, text), ...]` 伪代码行（`indent<0` 为顶层注释） |
 | `calls` | 调用到的函数名列表（可能带 `@plt`） |
 | `stack_vars` | 栈偏移 → 变量名（如 `v0`） |
 | `string_refs` | `lea` 目标地址 → 字符串 |
 | `effects` | 识别出的副作用，如 `("backdoor_shell", ...)` |
+| `engine` | `"ir"`（新管线）或 `"legacy"`（线性兜底，只在不支持时出现） |
 
-`render(pf)` 返回字符串，可直接打印或写进报告。
+底层 `antpwn.ir`（可单独使用）：
+
+| 类 / 函数 | 说明 |
+|---|---|
+| `FunctionIR` | 函数级 IR：`blocks`、`order`、`stack`、`calls`、`effects`、`loops`、`dom`/`pdom`、`unsupported` |
+| `Lifter` | 指令 → 语句/表达式提升（env 数据流、SysV 调用参数、canary 识别、rsp 帧跟踪） |
+| `Block` | 基本块：`insns`、`stmts`、`term`、`succs` |
+| `render(expr)` | 表达式优先级安全的 C 渲染（常量折叠/化简在构造时完成） |
+| `StackModel` | 栈槽 → `vN` 变量、数组大小推断 |
+
+IR 语句形态：`("assign", dst, expr)` / `("store", dst, expr)` / `("call", name, args)` /
+`("ret", expr)` / `("syscall",)` / `("comment", txt)`。表达式是元组：
+`("const", v)`、`("reg", name)`、`("var", name)`、`("str", text)`、`("addr", v)`、
+`("bin", op, a, b)`、`("un", op, a)`、`("mem", base, index)`、`("call", name, args)`、
+`("canary",)`。
+
+已知边界：无帧指针/-O2 的栈变量能恢复（`v0[88]` 这类按帧偏移推），大小是「帧偏移」近似；
+指针表达式只做 `[reg]`/`[reg*scale+disp]` 的浅层建模；`setcc`/`cmov`/`imul`/SSE 等指令
+尚未提升，会以 `// unsupported: ...` 标注并在函数头给出计数；不可约 CFG 回退到
+label+goto。`render(pf)` 保持纯文本，scanner/测试依赖该格式。
 
 ---
 
@@ -788,9 +820,9 @@ best, score = colony.run()
 
 ## 16. 边界与坑
 
-- **平台**：仅 Linux x86-64；`debugger` 在 import 时就加载 `libc.so.6`，Windows/macOS
+- **平台**：Linux（x86-64 内核，可 trace 32 位进程）；`debugger` 在 import 时就加载 `libc.so.6`，Windows/macOS
   上连 `import antpwn` 都会失败。
-- **32 位**：`ELF` 会抛 `ELFError`，整套分析按 x86-64 设计。
+- **32 位**：静态分析、反编译、ptrace 调试与 ret2text/ret2syscall/shellcode 利用已支持（`Process` 暴露 eip/esp/ebp）；fmt / heap / SROP / pivot 仅 64 位实现（32 位暂不支持）；ret2libc 的 i386 cdecl 链已端到端验证（Kali 自带 /lib32/libc）。
 - **全局状态**：`i18n.LANG` 是模块级变量，多线程/多任务并发时语言会互相影响。
 - **信息素文件**：默认写当前工作目录的 `antpwn_pheromone.json`；无锁，并发跑会互相覆盖；
   测试/CI 里建议显式传 `phero_path` 或跑前删除，保证结果可复现。
@@ -827,7 +859,8 @@ color.strip(s)                        # 去掉 ANSI 转义序列（写文件/断
 
 - 只有 stdout 是 TTY 时才输出 ANSI；管道、重定向、`capture_output` 采集时自动降级为
   纯文本，所以 `tests/run_all.py` 这类字符串匹配不受影响；
-- `ANTPWN_COLOR=1/0` 强制开关；`NO_COLOR` / `CLICOLOR=0` 关闭；
+- `NO_COLOR` / `CLICOLOR=0` 优先关闭（`ANTPWN_COLOR=always` 是唯一显式覆盖）；
+  其余情况 `ANTPWN_COLOR=1/0` 强制开关；
 - Windows 下自动开启控制台 VT 处理，失败即退化为纯文本；
 - 配色由 CLI 的 `--color auto|always|never` 控制（默认 `auto`）。
 
@@ -901,6 +934,9 @@ histedit.save()                         # 落历史
 - 全量回归：`python3 tests/run_all.py`（会连续起靶场进程，本地按需跑，CI 不跑）。
 - CI：`.github/workflows/test.yml` 做版本校验、`py_compile`、analyze/view/pwn 冒烟、
   unittest、wheel 构建；`.github/workflows/release.yml` 负责 tag 触发发版。
+- 打包后的命令：`antpwn`（CLI）、`antpwn-gdb`（打印/写入 gdbinit 片段）。
+- gdb 真跑测试：`bash tests/gdb_smoke.sh`（offset/trace/prompt/completion/leak/export），
+  CI 在装了 gdb 的 runner 上会执行。
 - 插件入口：`from antpwn import register_strategy, register_technique`。
 
 ---
@@ -914,7 +950,8 @@ histedit.save()                         # 落历史
 (gdb) antpwn help
 ```
 
-或在 `~/.gdbinit` 里：
+以 `pip install .` 安装后可以直接跑 `antpwn-gdb` 打印可粘贴的 `~/.gdbinit` 片段
+（`--write` 会追加写入），或者手工写：
 
 ```python
 python import sys; sys.path.insert(0, "/path/to/AntPwn"); import antpwn.gdbplugin; antpwn.gdbplugin.register()
@@ -924,22 +961,33 @@ python import sys; sys.path.insert(0, "/path/to/AntPwn"); import antpwn.gdbplugi
 
 | 命令 | 作用 |
 |---|---|
+| `antpwn where` | 崩溃现场上下文：`$pc` 所属函数/偏移、前后指令、`$rsp` 附近内存（带映射标注）、寄存器、backtrace |
 | `antpwn recon` / `info` | 保护、入口、函数/字符串数量 |
-| `antpwn vuln [kind\|func]` | 扫描漏洞并高亮（与 `view vuln` 同源） |
-| `antpwn disas [func\|addr] [n]` | 反汇编，漏洞行画 `\|`/`!`，当前 `$pc` 标 `=>` |
-| `antpwn pseudo [func\|addr]` | 伪代码 |
-| `antpwn xrefs [func]` | 调用关系（递归扫描构建，减少误报） |
-| `antpwn offset [gen [n]]` | 从当前崩溃现场反解 cyclic 偏移；`gen` 生成模式文件 |
-| `antpwn trace on\|off\|show` | 在危险 PLT 调用点下断点，记录参数与 backtrace，命中自动继续 |
-| `antpwn plan` | 结合会话内已知能力（offset、libc base）给出策略优先级 |
-| `antpwn prompt on\|off` | 专属提示符开关（默认开，关闭后恢复 gdb 默认提示符） |
+| `antpwn vuln [--bp]` | 扫描漏洞；每条 finding 附可直接粘贴的 `b *0x...`，`--bp` 自动下断（`--bp-off` 清除） |
+| `antpwn disas [target] [n]` | 无参围绕 `$pc`；支持 `$reg` 表达式与函数名；PIE 下运行时地址自动换算，`=>` 标当前 PC |
+| `antpwn pseudo [func]` | 伪代码；无参取 `$pc` 所在函数 |
+| `antpwn x [addr\|$reg] [n]` | 读内存（默认 `$rsp` 64 字节），运行中走 inferior，未运行回退到文件 |
+| `antpwn leak <addr\|$reg>` | 地址归属映射 + 基址偏移 + libc 符号名（如 `libc+0x29d90 ⇒ __libc_start_main+243`） |
+| `antpwn maps` | 内存映射表，标出 `$rsp` 所在区间 |
+| `antpwn offset [gen [n] [path]]` | 反解 cyclic 偏移；可传 `$rip`/`0x...` 直接解码；`gen` 生成 pwnlib 兼容 pattern |
+| `antpwn trace on [funcs...] [--stop] [--max=N] [--dump]` | 危险 PLT 调用点追踪：可过滤函数、命中即停、限次、dump 参数；命 gets/read/strcpy 时直接算 `saved_rip≈X`；连续重复自动折叠 |
+| `antpwn trace off/show/bps` | 关闭 / 命中统计 / 已挂断点 |
+| `antpwn plan` | 按会话能力给可行路线，每条附「下一步可粘贴命令」，不可行项标出缺什么；PIE gadget 给运行时地址；无 libc 映射时提示静态/musl |
+| `antpwn export <out.json\|out.html>` | 导出分析结果，json 额外带 `session` 段（offset/libc base/trace/寄存器） |
+| `antpwn report [out.html]` | 生成 HTML 会话报告（复用 `report.save_report`） |
+| `antpwn reset` | 清空会话能力/断点/`$antpwn_offset`/`$antpwn_libc_base` |
+| `antpwn prompt on\|off` | 专属提示符开关；默认开，关闭时链式交还给之前装的 hook（gef/pwndbg 不会被顶掉） |
 | `antpwn lang zh\|en` | 中英文切换 |
-| 其余 `view` 命令 | `ls` / `strings` / `find` / `gadget` / `export` / `x` 等直接可用 |
+| 其余 `view` 命令 | `ls` / `strings` / `find` / `gadget` / `plt` / `sec` 等直接可用（`antpwn help` 会全部列出） |
 
 设计要点：只读命令直接复用 `Repl` 与 `Scanner`，所以 gdb 里的判断和 CLI 一致；
-`offset` 走 gdb 自己的寄存器/内存读取，不再启动第二个 ptrace 调试器（两者不能同时
-控制同一进程）；`trace` 用 `gdb.Breakpoint` 子类，`stop()` 里记录信息后返回 `False`
-自动继续；`plan` 复用 `all_strategies()` 的静态可行性 + 会话能力，不执行利用。
+运行时地址 ↔ 文件地址换算靠 `info proc mappings` 的主程序基址，PIE 下 disas/where 才
+能用；`offset` 走 gdb 自己的寄存器/内存读取，不再启动第二个 ptrace 调试器；cyclic 与
+pwnlib/gef 的 de Bruijn 完全兼容（互相能解）；`trace` 用 `gdb.Breakpoint` 子类，
+`stop()` 返回 False 自动继续、`--stop` 时返回 True；`plan` 复用 `all_strategies()` 的
+静态可行性 + 会话能力，不执行利用；offset 成功会写 `$antpwn_offset` 并记一条
+`dt-offset` 信息素，和 CLI 共用同一个签名桶。
 
 限制：远程题仍建议用 CLI（`pwn --remote`）；gdb 侧不做 exploit 执行与多连接爆破；
-需要 gdb 编译时带 Python（主流发行版默认都有）。
+需要 gdb 编译时带 Python（主流发行版默认都有）。`tests/gdb_smoke.sh` 会真跑一个
+inferior 来验证 offset/trace/prompt/completion/leak/export，CI 有 gdb 时会执行。

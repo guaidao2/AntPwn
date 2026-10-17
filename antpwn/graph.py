@@ -85,6 +85,7 @@ class DecisionTree:
         ("canary",  lambda c: c.elf.canary),
         ("gadgets", lambda c: c.has_rop_gadgets),
         ("leak_fn", lambda c: c.has_leak_function),
+        ("arch32",  lambda c: getattr(c.elf, "bits", 64) == 32),
     ]
 
     def features(self, ctx):
@@ -236,3 +237,33 @@ class Colony:
                     return trail, True
         self._save()
         return None, False
+
+
+def record_edge(ctx, edge_name, win=True, phero_path="antpwn_pheromone.json"):
+    """Record one pheromone observation without running the whole colony.
+
+    Used by the gdb plugin: an offset recovered from a real crash inside gdb is
+    evidence worth keeping for the next run (`dt-offset`), and it shares the
+    same signature bucket as the CLI so both learn from each other.
+    """
+    stats = {}
+    try:
+        if os.path.exists(phero_path):
+            with open(phero_path) as fh:
+                stats = json.load(fh)
+    except Exception:
+        stats = {}
+    features = DecisionTree().features(ctx)
+    sig = json.dumps({k: (sorted(v) if isinstance(v, frozenset) else v)
+                      for k, v in features.items() if k != "caps"},
+                     sort_keys=True)
+    slot = stats.setdefault(sig, {}).setdefault(edge_name, [0, 0])
+    slot[1] += 1
+    if win:
+        slot[0] += 1
+    try:
+        with open(phero_path, "w") as fh:
+            json.dump(stats, fh, indent=1)
+    except OSError:
+        pass
+    return slot

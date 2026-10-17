@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "antpwn"
-version = "1.6.1"
+version = "1.7.0"
 description = "CTF Pwn analysis assistant: dependency-free ELF analysis, pseudo-code, planning and auto-verification"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -25,6 +25,7 @@ Repository = "https://github.com/guaidao2/AntPwn"
 
 [project.scripts]
 antpwn = "antpwn.cli:main"
+antpwn-gdb = "antpwn.gdb_loader:main"
 
 [tool.setuptools]
 packages = ["antpwn"]

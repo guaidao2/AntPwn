@@ -45,6 +45,22 @@ jobs:
       - name: Compile all modules
         run: python3 -m py_compile antpwn.py antpwn/*.py tests/run_all.py
 
+      - name: 32-bit toolchain probe (informational)
+        continue-on-error: true
+        run: |
+          if as --32 /dev/null -o /tmp/x.o 2>/dev/null && \
+             ld -m elf_i386 /tmp/x.o -o /tmp/x 2>/dev/null; then
+            echo "binutils --32 available"
+          else
+            echo "binutils --32 unavailable: i386 fixture tests will be skipped"
+          fi
+          if echo 'int main(void){return 0;}' >/tmp/t.c && \
+             gcc -m32 /tmp/t.c -o /tmp/t32 2>/dev/null; then
+            echo "gcc -m32 available"
+          else
+            echo "gcc -m32 unavailable: 32-bit libc fixtures will be skipped"
+          fi
+
       - name: Static analysis smoke (no target process)
         run: |
           set -eu
@@ -72,27 +88,14 @@ jobs:
           set -eu
           python3 -m unittest discover -s tests -v
 
-      - name: GDB plugin smoke (optional, needs gdb)
+      - name: GDB plugin smoke (real inferior, needs gdb)
         run: |
           set -eu
           if ! command -v gdb >/dev/null 2>&1; then
             echo "gdb not installed on this runner, skipping"
             exit 0
           fi
-          gdb -q -batch \
-            -ex "source antpwn-gdb.py" \
-            -ex "file challenges/bin/baby_bof" \
-            -ex "antpwn recon" \
-            -ex "antpwn vuln" \
-            -ex "antpwn disas vuln 32" \
-            -ex "antpwn pseudo vuln" \
-            -ex "antpwn xrefs vuln" \
-            -ex "antpwn offset gen 200" \
-            -ex "antpwn plan" \
-            2>&1 | tee /tmp/gdb.log
-          grep -q "PIE" /tmp/gdb.log
-          grep -q "bof" /tmp/gdb.log
-          grep -q "可行路线\|feasible routes" /tmp/gdb.log
+          bash tests/gdb_smoke.sh
 
       - name: Package build sanity
         run: |

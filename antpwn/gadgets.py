@@ -31,6 +31,23 @@ WANT = {
 }
 
 
+WANT32 = {
+    "pop eax": (b"\x58\xc3", "pop eax; ret"),
+    "pop ebx": (b"\x5b\xc3", "pop ebx; ret"),
+    "pop ecx": (b"\x59\xc3", "pop ecx; ret"),
+    "pop edx": (b"\x5a\xc3", "pop edx; ret"),
+    "pop esi": (b"\x5e\xc3", "pop esi; ret"),
+    "pop edi": (b"\x5f\xc3", "pop edi; ret"),
+    "pop ebp": (b"\x5d\xc3", "pop ebp; ret"),
+    "ret":     (b"\xc3", "ret"),
+    "leave;ret": (b"\xc9\xc3", "leave; ret"),
+    "int 0x80": (b"\xcd\x80", "int 0x80"),
+    "int 0x80;ret": (b"\xcd\x80\xc3", "int 0x80; ret"),
+    "jmp esp": (b"\xff\xe4", "jmp esp"),
+    "call esp": (b"\xff\xd4", "call esp"),
+}
+
+
 class GadgetFinder:
     def __init__(self, elf):
         self.elf = elf
@@ -42,9 +59,10 @@ class GadgetFinder:
 
     def find_all(self):
         gadgets = {}
+        want = WANT if getattr(self.elf, "bits", 64) == 64 else WANT32
         for p in self.exec_segments():
             code = self.elf.data[p.off:p.off + p.filesz]
-            for name, (pat, desc) in WANT.items():
+            for name, (pat, desc) in want.items():
                 start = 0
                 while True:
                     i = code.find(pat, start)

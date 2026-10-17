@@ -300,6 +300,400 @@ class TestNewStrategies(unittest.TestCase):
         self.assertEqual(canary, secret)
 
 
+class TestCyclic(unittest.TestCase):
+    def test_pwnlib_compatible_pattern(self):
+        from antpwn.exploits import cyclic
+        self.assertEqual(cyclic(8), b"aaaabaaa")
+        self.assertEqual(cyclic(32), b"aaaabaaacaaadaaaeaaafaaagaaahaaa")
+
+    def test_find_bytes_and_int(self):
+        from antpwn.exploits import cyclic, cyclic_find
+        pat = cyclic(128)
+        self.assertEqual(cyclic_find(pat[72:80]), 72)
+        self.assertEqual(cyclic_find(0x61616161), 0)      # b"aaaa"
+        self.assertIsNone(cyclic_find(b"\xde\xad\xbe\xef\xde\xad\xbe\xef"))
+
+    def test_windows_are_unique(self):
+        from antpwn.exploits import cyclic_find
+        from antpwn.exploits import cyclic
+        pat = cyclic(256)
+        seen = {}
+        for i in range(0, 256 - 8, 4):
+            off = cyclic_find(pat[i:i + 8])
+            self.assertEqual(off, i)
+            seen[off] = True
+
+
+class TestColorEnv(unittest.TestCase):
+    def _reset(self):
+        from antpwn import color
+        color._enabled = None
+
+    def test_no_color_wins_unless_forced(self):
+        import os
+        old = {k: os.environ.get(k) for k in ("NO_COLOR", "ANTPWN_COLOR", "CLICOLOR")}
+        try:
+            os.environ["NO_COLOR"] = "1"
+            os.environ["ANTPWN_COLOR"] = "1"
+            self._reset()
+            from antpwn import color
+            self.assertFalse(color.enabled())
+            os.environ["ANTPWN_COLOR"] = "always"
+            self._reset()
+            self.assertTrue(color.enabled())
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            self._reset()
+
+
+class TestGdbLoader(unittest.TestCase):
+    def test_snippet(self):
+        from antpwn import gdb_loader
+        line = gdb_loader.gdbinit_line()
+        self.assertIn("sys.path.insert", line)
+        self.assertIn("antpwn.gdbplugin.register()", line)
+
+
+class TestDecompilerIR(unittest.TestCase):
+    def _decompile(self, rel, fn):
+        from antpwn import ELF
+        from antpwn.decompiler import Decompiler
+        elf = ELF(_demo(rel))
+        dec = Decompiler(elf)
+        pf = dec.function(elf.sym(fn))
+        self.assertIsNotNone(pf)
+        return dec, pf
+
+    def test_calls_and_stack_buffers(self):
+        dec, pf = self._decompile("challenges/bin/baby_bof", "vuln")
+        text = dec.render(pf)
+        self.assertIn("char v0[64];", text)
+        self.assertIn('gets@plt(v0)', text)
+        self.assertIn('puts@plt("', text)
+        self.assertIn("return", text)
+
+    def test_structuring_loop_and_branches(self):
+        dec, pf = self._decompile("challenges/bin/heap_uaf", "main")
+        text = dec.render(pf)
+        self.assertIn("while (", text)
+        self.assertIn("if (", text)
+        self.assertTrue("continue;" in text or "break;" in text)
+        self.assertIn("fgets@plt(", text)
+
+    def test_o2_rsp_frame_buffer(self):
+        dec, pf = self._decompile("challenges/adv/t1_o2", "entry_point")
+        text = dec.render(pf)
+        self.assertIn("char v0[88];", text)
+        self.assertIn("read@plt(0, v0, 0x12c);", text)
+
+    def test_loop_header_stays_inside_loop(self):
+        dec, pf = self._decompile("challenges/bin/heap_uaf", "main")
+        text = dec.render(pf)
+        loop_at = text.find("while (1)")
+        menu_at = text.find("menu();")
+        self.assertGreaterEqual(loop_at, 0)
+        self.assertGreater(menu_at, loop_at)
+        self.assertIn("== 0) break;", text)
+
+    def test_engine_marker_and_decls(self):
+        import re as _re
+        dec, pf = self._decompile("challenges/bin/baby_bof", "vuln")
+        self.assertEqual(pf.engine, "ir")
+        text = dec.render(pf)
+        for name in set(_re.findall(r"\b(v\d+)\b", text)):
+            self.assertRegex(text, r"(?:char|uint64_t) " + name + r"[\[;]")
+
+    def test_canary_guard_hidden(self):
+        dec, pf = self._decompile("challenges/adv/t2_canary", "handler")
+        text = dec.render(pf)
+        # the guard slot and the always-true comparison are folded away
+        self.assertNotIn("flags", text)
+        self.assertNotIn("__stack_chk_fail", text)
+        self.assertIn("read@plt(0, v1, 0x12c);", text)
+
+    def test_ir_cfg_and_loops(self):
+        from antpwn import ELF
+        from antpwn.disasm import Disasm
+        from antpwn.decompiler import Decompiler
+        from antpwn.ir import FunctionIR, Lifter
+        elf = ELF(_demo("challenges/bin/heap_uaf"))
+        sym = elf.sym("main")
+        code = elf.read(sym.value, sym.size or 0x400)
+        insns = Disasm(code, sym.value).recursive(len(code), [0])
+        ir = FunctionIR("main", insns[0].addr)
+        Lifter(elf, ir, sym.value).lift(insns, Decompiler(elf).strmap)
+        self.assertGreater(len(ir.blocks), 3)
+        self.assertTrue(ir.loops)
+        self.assertTrue(any(s[0] == "call" for a in ir.order
+                            for s in ir.blocks[a].stmts))
+
+
+class TestDecompilerColor(unittest.TestCase):
+    def test_ansi_only_when_enabled(self):
+        import os
+        from antpwn import ELF, color
+        from antpwn.decompiler import Decompiler
+        old = {k: os.environ.get(k) for k in ("ANTPWN_COLOR", "NO_COLOR")}
+        try:
+            os.environ["ANTPWN_COLOR"] = "1"
+            os.environ.pop("NO_COLOR", None)
+            color._enabled = None
+            elf = ELF(_demo("challenges/bin/baby_bof"))
+            dec = Decompiler(elf)
+            pf = dec.function(elf.sym("vuln"))
+            self.assertIn("\x1b[", dec.render_ansi(pf))
+            self.assertNotIn("\x1b[", dec.render(pf))
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            color._enabled = None
+
+
+class TestI386(unittest.TestCase):
+    """32-bit ELF support: fixtures are assembled with as --32 + ld -m elf_i386"""
+
+    @classmethod
+    def setUpClass(cls):
+        if not (shutil.which("as") and shutil.which("ld")):
+            raise unittest.SkipTest("binutils (as/ld) not available")
+        fixtures = pathlib.Path(__file__).resolve().parent / "fixtures"
+        cls.tmp = tempfile.mkdtemp(prefix="antpwn-i386-")
+        cls.bins = {}
+        # capability probe: `as` may exist without 32-bit support on a runner
+        probe_o = os.path.join(cls.tmp, "probe.o")
+        try:
+            subprocess.run(["as", "--32", str(fixtures / "i386_bof.s"),
+                            "-o", probe_o], check=True, capture_output=True)
+            subprocess.run(["ld", "-m", "elf_i386", probe_o,
+                            "-o", os.path.join(cls.tmp, "probe")],
+                           check=True, capture_output=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            shutil.rmtree(cls.tmp, ignore_errors=True)
+            raise unittest.SkipTest(f"binutils lacks 32-bit support: {exc}")
+        for name in ("i386_bof", "i386_loop", "i386_syscall", "i386_shellcode"):
+            out = os.path.join(cls.tmp, name)
+            src = str(fixtures / (name + ".s"))
+            obj = os.path.join(cls.tmp, name + ".o")
+            subprocess.run(["as", "--32", src, "-o", obj], check=True)
+            extra = ["-z", "execstack"] if name == "i386_shellcode" else []
+            subprocess.run(["ld", "-m", "elf_i386", *extra, obj, "-o", out],
+                           check=True)
+            cls.bins[name] = out
+        # optional: dynamic 32-bit fixtures (needs gcc -m32 + 32-bit libc)
+        src = str(fixtures / "i386_ret2libc.c")
+        out = os.path.join(cls.tmp, "i386_ret2libc")
+        try:
+            subprocess.run(["gcc", "-m32", "-fno-stack-protector", "-no-pie",
+                            "-o", out, src], check=True,
+                           capture_output=True)
+            cls.bins["i386_ret2libc"] = out
+        except (OSError, subprocess.CalledProcessError):
+            pass
+        pie = os.path.join(cls.tmp, "i386_pie")
+        try:
+            subprocess.run(["gcc", "-m32", "-fno-stack-protector", "-pie",
+                            "-fPIE", "-o", pie, src], check=True,
+                           capture_output=True)
+            cls.bins["i386_pie"] = pie
+        except (OSError, subprocess.CalledProcessError):
+            pass
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_elf32_parse_and_disasm(self):
+        from antpwn import ELF
+        from antpwn.disasm import Disasm
+        elf = ELF(self.bins["i386_bof"])
+        self.assertEqual(elf.bits, 32)
+        self.assertEqual(elf.e_machine, 3)
+        self.assertFalse(elf.is_pie)
+        sym = elf.sym("vuln")
+        self.assertTrue(sym)
+        code = elf.read(sym.value, sym.size)
+        insns = Disasm(code, sym.value, 32).recursive(len(code), [0])
+        text = "; ".join(f"{i.mnem} {', '.join(i.ops)}" for i in insns[:4])
+        self.assertIn("mov ebp, esp", text)
+        self.assertIn("push 0x12c", text)
+
+    def test_gadgets32(self):
+        from antpwn import ELF, GadgetFinder
+        elf = ELF(self.bins["i386_syscall"])
+        names = set(GadgetFinder(elf).find_all())
+        for need in ("pop eax", "pop ebx", "pop ecx", "pop edx", "int 0x80"):
+            self.assertIn(need, names)
+
+    def test_shellcode32_bytes(self):
+        from antpwn.exploits import SHELLCODE32
+        self.assertLessEqual(len(SHELLCODE32), 32)
+        self.assertIn(b"\xcd\x80", SHELLCODE32)
+
+    def test_process32_regs(self):
+        from antpwn.debugger import Process
+        proc = Process(self.bins["i386_bof"])
+        try:
+            try:
+                proc.start()
+                regs = proc.getregs()
+            except Exception as exc:      # ptrace disabled / no IA32 compat
+                self.skipTest(f"cannot ptrace a 32-bit process here: {exc}")
+            self.assertEqual(proc.bits, 32)
+            self.assertEqual(regs.eip, regs.rip)
+            self.assertEqual(regs.esp, regs.rsp)
+            self.assertTrue(0x08048000 <= regs.eip < 0x10000000)
+        finally:
+            if proc.pid:
+                proc.kill()
+
+    def test_ret2libc32_fixture(self):
+        if "i386_ret2libc" not in self.bins:
+            self.skipTest("gcc -m32 with 32-bit libc not available")
+        from antpwn import ELF, GadgetFinder
+        elf = ELF(self.bins["i386_ret2libc"])
+        self.assertEqual(elf.bits, 32)
+        self.assertIn("puts", elf.got_map())
+        self.assertIn("read", elf.got_map())
+        self.assertTrue(elf.plt_map())
+        self.assertIn("ret", GadgetFinder(elf).find_all())
+
+    def test_0f_fallback_keeps_length(self):
+        from antpwn.disasm import Disasm
+        # bswap eax (0f c8, no ModRM) followed by nops must not desync
+        ins = Disasm(b"\x0f\xc8\x90\x90\x90", 0x1000, 64).linear(5)
+        self.assertEqual([i.mnem for i in ins], ["bswap", "nop", "nop", "nop"])
+        self.assertEqual(ins[0].size, 2)
+        self.assertEqual(Disasm(b"\x0f\x77\x90", 0x1000, 32).decode_one(0).mnem, "emms")
+        shld = Disasm(b"\x0f\xa4\xc0\x01", 0x1000, 64).decode_one(0)
+        self.assertEqual(shld.size, 4)
+        three = Disasm(b"\x0f\x38\x00\xc0", 0x1000, 64).decode_one(0)
+        self.assertEqual(three.size, 4)
+
+    def test_stack_arg_requires_i386_frame(self):
+        from antpwn.ir import parse_mem, StackModel
+        st64 = StackModel()
+        st64.bits = 64
+        e64 = parse_mem("[rbp+0x10]", st64, 0)
+        self.assertEqual(e64[0], "var")
+        self.assertEqual(st64.params, [])
+        st32 = StackModel()
+        st32.bits = 32
+        st32.fp_frame = False
+        e32 = parse_mem("[ebp+8]", st32, 0)
+        self.assertEqual(e32[0], "var")
+        st32.fp_frame = True
+        e_arg = parse_mem("[ebp+8]", st32, 0)
+        self.assertEqual(e_arg[0], "var")
+        self.assertEqual(st32.params, ["arg0"])
+
+    def test_dag_edges_honour_arch(self):
+        from antpwn import ELF, Scanner, GadgetFinder
+        from antpwn.exploits import ExploitContext
+        from antpwn.fsm import FSM
+        elf = ELF(self.bins["i386_bof"])
+        fsm = FSM(self.bins["i386_bof"], use_pheromone=False)
+        fsm.elf = elf
+        fsm.scanner = Scanner(elf)
+        ctx = ExploitContext(elf, fsm.scanner, GadgetFinder(elf), None)
+        edges = {e.name: e for e in fsm.build_edges(ctx)}
+        for name in ("fmt-k", "fmt-backdoor", "fmt-leak", "heap-leak"):
+            self.assertIn(name, edges)
+            self.assertFalse(edges[name].feasible(ctx),
+                             f"{name} must be blocked on i386")
+
+    def test_i386_push_save_is_not_an_argument(self):
+        from antpwn import ELF
+        from antpwn.decompiler import Decompiler
+        elf = ELF(self.bins["i386_bof"])
+        dec = Decompiler(elf)
+        text = dec.render(dec.function(elf.sym("demo")))
+        self.assertIn("sink(0x41)", text)
+        self.assertNotIn("sink(0x41, ebx)", text)
+
+    def test_i386_inc_dec_decode(self):
+        from antpwn.disasm import Disasm
+        d = Disasm(b"\x40\x48\x43", 0x1000, 32)
+        self.assertEqual((d.decode_one(0).mnem, d.decode_one(0).ops), ("inc", ["eax"]))
+        self.assertEqual(d.decode_one(1).mnem, "dec")
+        self.assertEqual(d.decode_one(1).ops, ["eax"])
+        self.assertEqual(d.decode_one(2).mnem, "inc")
+        self.assertEqual(d.decode_one(2).ops, ["ebx"])
+
+    def test_movsxd_regression(self):
+        from antpwn.disasm import Disasm
+        ins = Disasm(b"\x48\x63\xc0", 0x1000, 64).decode_one(0)
+        self.assertEqual(ins.mnem, "movsxd")
+        self.assertEqual(ins.size, 3)
+
+    def test_unknown_prefixed_sse_length(self):
+        from antpwn.disasm import Disasm
+        ins = Disasm(b"\x66\x0f\x6f\xc0", 0x1000, 32).decode_one(0)
+        self.assertEqual(ins.size, 4)   # length must include the 0x66 prefix
+        ins2 = Disasm(b"\x48\x0f\x28\xc0", 0x1000, 64).decode_one(0)
+        self.assertEqual(ins2.size, 4)
+
+    def test_i386_cdecl_params_and_syscall_ret(self):
+        from antpwn import ELF
+        from antpwn.decompiler import Decompiler
+        elf = ELF(self.bins["i386_bof"])
+        dec = Decompiler(elf)
+        text = dec.render(dec.function(elf.sym("read")))
+        self.assertIn("uint32_t arg0", text)
+        self.assertIn("uint32_t arg2", text)
+        self.assertIn("syscall()", text)
+        self.assertNotIn("return 0x3", text)
+
+    def test_i386_no_duplicate_function_entries(self):
+        from antpwn import ELF, Scanner
+        elf = ELF(self.bins["i386_bof"])
+        bof = [f for f in Scanner(elf).scan() if f.kind == "bof"]
+        self.assertEqual(len(bof), 1, [f.func for f in bof])
+
+    def test_arch_guards(self):
+        from antpwn import ELF, Scanner, GadgetFinder
+        from antpwn.exploits import ExploitContext, FmtGOT, HeapUAF, Ret2Text
+        elf = ELF(self.bins["i386_bof"])
+        ctx = ExploitContext(elf, Scanner(elf), GadgetFinder(elf), None)
+        self.assertFalse(FmtGOT(ctx).supported())
+        self.assertFalse(HeapUAF(ctx).supported())
+        self.assertTrue(Ret2Text(ctx).supported())
+        from antpwn.exploits import Ret2OneGadget
+        self.assertFalse(Ret2OneGadget(ctx).supported())
+
+    def test_i386_pie_plt_map(self):
+        if "i386_pie" not in self.bins:
+            self.skipTest("gcc -m32 -pie not available")
+        from antpwn import ELF
+        elf = ELF(self.bins["i386_pie"])
+        self.assertEqual(elf.bits, 32)
+        self.assertTrue(elf.is_pie)
+        names = set(elf.plt_map().values())
+        self.assertTrue(names, "32-bit PIE PLT stubs (ff a3) not resolved")
+        self.assertIn("puts", names)
+        self.assertIn("read", names)
+
+    def test_decompiler_i386(self):
+        from antpwn import ELF
+        from antpwn.decompiler import Decompiler
+        elf = ELF(self.bins["i386_bof"])
+        dec = Decompiler(elf)
+        text = dec.render(dec.function(elf.sym("vuln")))
+        self.assertIn("read(0, v0, 0x12c)", text)
+        self.assertIn("char v0[64];", text)
+        loop = ELF(self.bins["i386_loop"])
+        text2 = Decompiler(loop).render(Decompiler(loop).function(loop.sym("compute")))
+        self.assertIn("while (v0 < 0xa)", text2)
+        self.assertIn("v1 = v1 + v0", text2)
+        self.assertIn("uint32_t", text2)
+
+
 class TestPackagingFiles(unittest.TestCase):
     def test_pyproject_and_ci(self):
         root = pathlib.Path(__file__).resolve().parent.parent
