@@ -1,9 +1,13 @@
 name: test
 
+# 测试工作流：main 推送 / PR 触发，同时也是 release 工作流的可复用前置（workflow_call）。
+# 只有这里的全部步骤通过，release 工作流才会创建 GitHub Release。
+
 on:
   push:
     branches: ["main"]
   pull_request:
+  workflow_call:
   workflow_dispatch:
 
 permissions:
