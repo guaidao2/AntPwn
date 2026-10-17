@@ -1,0 +1,7 @@
+# 统一换行：仓库内一律 LF；脚本在 Windows 上也保持 LF 以保证 Linux 可执行
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.c text eol=lf
+*.S text eol=lf
+*.md text eol=lf

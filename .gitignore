@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 运行时产物
+antpwn_pheromone.json
+*.report.html
+out*.html
+
+# 临时目录
+.tmp/
+tmp/

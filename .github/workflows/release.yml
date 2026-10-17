@@ -1,0 +1,69 @@
+name: release
+
+# 推送 vX.Y.Z 标签时自动发布：校验版本号、跑 smoke test、打包源码、创建 GitHub Release。
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify tag matches package version
+        run: |
+          set -eu
+          TAG="${GITHUB_REF_NAME#v}"
+          VER=$(python3 - <<'PY'
+          import pathlib, re
+          text = pathlib.Path("antpwn/__init__.py").read_text(encoding="utf-8")
+          print(re.search(r'__version__\s*=\s*"([^"]+)"', text).group(1))
+          PY
+          )
+          echo "tag=$TAG package=$VER"
+          if [ "$TAG" != "$VER" ]; then
+            echo "ERROR: tag ${GITHUB_REF_NAME} does not match antpwn.__version__ ($VER)" >&2
+            exit 1
+          fi
+
+      - name: Smoke test (dependency-free)
+        run: |
+          set -eu
+          python3 -m py_compile antpwn.py antpwn/*.py tests/run_all.py
+          python3 antpwn.py analyze challenges/bin/baby_bof | tee /tmp/analyze.log
+          grep -q "PIE" /tmp/analyze.log
+          grep -q "bof" /tmp/analyze.log
+
+      - name: Build source archive
+        run: |
+          set -eu
+          mkdir -p dist
+          git archive --format=zip \
+            --prefix="AntPwn-${GITHUB_REF_NAME}/" \
+            -o "dist/AntPwn-${GITHUB_REF_NAME}.zip" HEAD
+          ls -l dist
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "AntPwn ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag \
+            "dist/AntPwn-${GITHUB_REF_NAME}.zip"

@@ -1,0 +1,169 @@
+# AntPwn 蚁刃 — Pwn 分析助手（分析 · 决策 · 自动验证）
+
+[中文](README.md) | [English](README.en.md)
+
+> by guaidao2 · coolmoon
+
+**author: guaidao2** · version 1.3.0 · 中英双语 / bilingual
+
+> 原生静态分析 · 伪代码还原 · 漏洞扫描 · ptrace 动态调试 · 能力 DAG 规划 · 状态机驱动
+
+**零第三方依赖**：不依赖 pwntools / gdb / capstone / ropper / angr，全部用纯 Python
+原生实现（自带 ELF64 解析器、x86-64 反汇编器、ptrace 调试器、libc 偏移提取）。
+
+---
+
+## 定位：它是助手，不是交 payload 的机器
+
+AntPwn 的核心是**辅助分析与决策支持**：把二进制拆开、把保护认清楚、把漏洞按危险度
+排出来、给出可解释的解题路线，再**自动跑一遍验证这条路线成不成立**。它不替你产出
+exploit 脚本或 payload 文本，也不承诺"丢进去就出 flag"——它把判断、依据和验证结果
+交给你，让你看得懂、能接管、能复现。
+
+自动解题（`pwn`）在这个定位里是**验证手段**：工具按自己的决策树在能力图（DAG）上找
+一条路，实际起进程去试；成了说明判断成立，不成就把失败原因讲清楚。所以你看到的不是
+一堆魔改字节，而是一串「它在想什么、依据是什么、为什么这么走」。
+
+依赖极少也是刻意的：纯标准库，无网、无 pip 的比赛容器里拷过去就能跑，别人也能把
+`antpwn` 当库 import 进自己的工具链。
+
+## 功能一览 / Features
+
+| 模块 | 说明 |
+|---|---|
+| 静态分析 | 原生 ELF64 解析：PIE / NX / Canary / RELRO / ExecStack 保护识别，符号、PLT/GOT、重定位 |
+| 伪代码还原 | 自研反汇编器 + 参数折叠，输出类 C 伪代码：`read(0, v0, 0x200)`、`system("/bin/sh")` |
+| 漏洞扫描 | 规则引擎 + 模式识别：栈溢出 / 格式化字符串 / UAF / 后门函数 / 危险字符串，按危险度评分 |
+| 动态调试 | ctypes-ptrace 调试器：软件断点、单步、寄存器读写、内存读写、崩溃现场分析 |
+| 决策与规划 | 能力 DAG + 决策树 + 蚁群：能力分 session/process 域，失败蚂蚁留下的能力可复用，偏移用崩溃取证推断，信息素按二进制特征持久化 |
+| 状态机 | RECON → DECOMPILE → SCAN → STRATEGY → OFFSET → BUILD → TEST → VERIFY，每步都有中文说明 |
+| 自动验证 | 8 种用户态策略，基于行为特征而非函数名；跑通即拿到交互式 shell，用来验证判断而不是替你交差 |
+| 失败诊断 | 策略不可行时说明原因：缺 gadget / 缺泄露通道 / PIE 与 Canary 卡在哪一步，并给出下一步方向 |
+| 报告与双语 | `--lang zh / en`；`--report out.html` 输出分析结论与决策记录 |
+| 可嵌入 | `antpwn` 是纯标准库包，CLI 只是薄壳，分析/调试/状态机均可直接当函数库用 |
+
+## 它适合什么场景
+
+- 比赛里拿到陌生二进制，想快速看清保护、漏洞和一条可解释的解题路线；
+- 想跟着日志理解"为什么这条链能打、那条为什么不行"，而不是只拿到一个脚本；
+- 要在自己的工具/平台里嵌入 ELF 分析、伪代码、ptrace 调试或自动验证能力；
+- 环境受限（无网、不能装包、容器只带 python3）但需要一套完整的分析链。
+
+如果你要的是"批量生成 exploit 脚本"那种交付形态，那和本项目的定位不同——AntPwn 选择
+把过程讲清楚，把最后一公里留给人。
+
+## 支持的用户态利用策略 / Strategies
+
+1. **ret2text** — 检测后门函数（行为：`system("/bin/sh")`，或可疑符号名）
+2. **ret2libc** — 泄露 `puts@GOT` → 算 libc 基址 → 返回溢出函数二次触发 → `system("/bin/sh")`
+3. **ret2syscall** — ROP 链设置寄存器 → `execve("/bin/sh",0,0)`
+4. **格式化字符串** — `%p` 喷射动态定位参数偏移；有后门则 `%hn` 覆写 GOT，**无后门则 `%s` 泄露 libc → printf@GOT→system**（通用路线）
+5. **shellcode** — ExecStack + `jmp rsp`
+6. **SROP** — 伪造 sigreturn 帧
+7. **栈迁移 (pivot)** — 小溢出 + `leave;ret` 劫持到 bss
+8. **堆利用 (heap)** — UAF 双读精确解 safe-linking chunk 地址 → tcache poisoning 落到程序指针数组 → 伪造槽位 → 泄露 libc → `free@GOT = system`
+
+## 快速上手 / Quick Start
+
+```bash
+# 只做分析（保护识别 + 漏洞扫描 + 伪代码），不启动目标进程
+python3 antpwn.py analyze ./challenges/bin/baby_bof --pseudo
+
+# 只看某个函数的伪代码
+python3 antpwn.py analyze ./baby_bof --pseudo --func vuln
+
+# 让工具自己走一遍并验证路线（成功即拿到交互 shell）
+python3 antpwn.py pwn ./challenges/bin/ret2libc
+
+# 自动验证 + HTML 报告 + 英文输出
+python3 antpwn.py pwn ./pwn200 --report out.html --lang en
+```
+
+参数（溢出偏移、fmt 参数位置、堆 chunk 地址）全部动态探测，不依赖特定函数名或题目提示语；
+判断依据和失败原因都写在终端的步骤日志与报告里。
+
+## 作为函数库使用 / Library API
+
+`antpwn` 是纯标准库包，CLI 只是薄壳：分析、反汇编、调试、决策、报告都能直接调用。
+
+```python
+from antpwn import ELF, Decompiler, Scanner, GadgetFinder, Process, FSM, Tube
+
+elf  = ELF("./vuln")                 # 解析: 保护/gadgets/GOT/符号
+dc   = Decompiler(elf)               # 伪代码还原
+pf   = dc.function(elf.sym("main"))  # -> PseudoFunc (lines/calls/string_refs)
+scan = Scanner(elf); scan.scan()     # 漏洞扫描 (bof/fmt/heap/backdoor)
+gf   = GadgetFinder(elf)
+rdi  = gf.first("pop rdi")           # 首个 pop rdi 地址, 找不到返回 None
+proc = Process("./vuln"); proc.start()
+proc.send(b"AAAA\n"); proc.cont()   # ptrace 调试: 寄存器/内存读写/断点
+regs = proc.getregs(); mem = proc.read_mem(regs.rsp, 0x40)
+
+fsm = FSM("./vuln")                  # 决策树 × 蚁群 × 能力 DAG
+ok  = fsm.run()                      # -> True 且 report_data 带全程记录
+```
+
+完整接口（模块、参数、数据结构、扩展示例、坑）见 **[docs/API.md](docs/API.md)**。
+
+把上面的对象接到自己的脚本、平台或比赛工具里，就是 AntPwn 作为"助手"的另一种用法。
+
+## 自测 / 验证
+
+```bash
+bash challenges/build.sh      # 重建 8 道内置靶场题
+python3 tests/run_all.py      # 11/11 全部拿下（8 靶场 + 2 盲测 + 1 优化题）
+                              # 另 2 道无解题（t2_canary / t3_pie）验证"优雅失败 + 诊断"
+```
+
+**盲测证明泛化性**（`challenges/blind/`，函数名/提示语/偏移与开发集完全不同）：
+- `mystery1`：无后门、无 /bin/sh、陌生函数名 → 自动走 ret2libc 通用泄露链（通过）
+- `mystery2`：格式化字符串且无后门 → 自动走 fmt→libc 通用路线（通过）
+
+对 `/bin/ls`（stripped + PIE + Full RELRO）分析不崩溃，正常输出保护与发现。整套自测不需要
+任何第三方 Python 包。
+
+## 目录结构
+
+```
+AntPwn/
+├── antpwn/            # 核心工具包（纯 Python, 零依赖）
+│   ├── elf.py         #   ELF64 解析
+│   ├── disasm.py      #   x86-64 反汇编器（与 objdump 对拍一致）
+│   ├── decompiler.py  #   伪代码还原
+│   ├── scanner.py     #   漏洞扫描规则引擎
+│   ├── gadgets.py     #   ROP gadget 搜索
+│   ├── debugger.py    #   ptrace 动态调试器
+│   ├── procio.py      #   进程交互 tube
+│   ├── aco.py         #   蚁群算法
+│   ├── graph.py       #   能力 DAG + 决策树 + 信息素
+│   ├── exploits.py    #   8 种利用策略
+│   ├── fsm.py         #   解题状态机
+│   ├── i18n.py        #   中英双语
+│   ├── report.py      #   HTML 报告
+│   └── cli.py         #   命令行入口
+├── challenges/        # 8 道原创靶场题（含源码）+ 3 道高级题 + 2 道盲测题
+├── docs/API.md        # 完整 API 文档（模块 / 数据结构 / 扩展示例）
+├── docs/API.en.md     # 同上英文版 / English version of the API reference
+├── README.en.md       # 英文版 README / English README
+└── tests/run_all.py   # 全量回归
+```
+
+## 已知边界 / Limitations
+
+- 仅支持 ELF64 / x86-64（开发环境无 32 位库）；32 位与静态链接场景暂未覆盖
+- `antpwn_pheromone.json` 是学习产物（按二进制特征向量存边统计），删掉即重置经验
+- PIE + 无泄露通道、Full RELRO + 无 fmt/堆、Canary 无泄露等"无解或需高级技巧"场景会
+  如实报告失败并给出诊断，不编造可行路径
+- **不生成独立的 exploit 脚本或 payload 文本**：payload 在进程内构造与发送；需要复现时
+  按报告里的策略与参数自己写脚本
+- 远程题需本地有相同 libc（`ldd` 自动定位）；远程交互暂不内置（可复用 `antpwn.procio.Tube`）
+
+---
+
+## 许可 / License
+
+MIT —— 见 [LICENSE](LICENSE)。Copyright (c) 2026 guaidao2 & coolmoon。
+
+---
+
+*AntPwn — analysis assistant for CTF pwn: explainable, embeddable, dependency-free. by guaidao2*
